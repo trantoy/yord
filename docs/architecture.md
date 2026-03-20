@@ -50,11 +50,12 @@ The tree is a **view** over flat data, not the data itself.
 
 ```rust
 // Each node is an entity with a set of components
+// M1: single parent_id. Future: parent_ids[] for shared nodes.
 Entity {
   id: "term-1",
   components: {
     Label:      { text: "terminal" },
-    BelongsTo:  { parent_ids: ["project-saas"] },  // array, not a single value
+    BelongsTo:  { parent_id: "project-saas" },     // M1: scalar
     Order:      { index: 0 },
     Pty:        { cmd: ["zsh"], cwd: "~/saas" },
     Running:    { pid: 4821 },
@@ -65,7 +66,8 @@ Entity {
   id: "agent-1",
   components: {
     Label:      { text: "architect agent" },
-    BelongsTo:  { parent_ids: ["project-saas", "project-sdk"] },  // two parents
+    BelongsTo:  { parent_id: "project-saas" },     // M1: single parent
+    // Future: { parent_ids: ["project-saas", "project-sdk"] } for shared nodes
     Agent:      { model: "claude-opus", context_node_ids: ["term-1"] },
     Running:    { pid: 4900 },
   }
@@ -77,7 +79,7 @@ Entity {
 ```typescript
 function buildTree(entities: Entity[]): TreeNode[] {
   // 1. find root nodes (BelongsTo is empty or absent)
-  // 2. group by parent_ids
+  // 2. group by parent_id
   // 3. sort by Order.index
   // 4. return nested structure for rendering
 }
@@ -101,7 +103,7 @@ project-saas
 project-sdk
   └── agent ← had to duplicate
 
-// Hybrid — native:
+// Hybrid — native (future, with parent_ids[]):
 entity:agent  [BelongsTo: [project-saas, project-sdk]]
 ```
 
@@ -199,9 +201,11 @@ You can start with a pure tree in v1. The hybrid is the same model but with the 
 
 ## Storage Layer
 
-SQLite. Two tables instead of one:
+SQLite. Two tables instead of one. Requires `PRAGMA foreign_keys = ON` at connection time for cascading deletes.
 
 ```sql
+PRAGMA foreign_keys = ON;
+
 -- Entities
 CREATE TABLE entities (
   id         TEXT PRIMARY KEY,
@@ -219,19 +223,29 @@ CREATE TABLE components (
 
 -- Indexes for fast queries
 CREATE INDEX idx_component_type ON components(component_type);
-CREATE INDEX idx_belongs_to ON components(json_extract(data, '$.parent_ids'));
+CREATE INDEX idx_belongs_to ON components(component_type, json_extract(data, '$.parent_id'))
+  WHERE component_type = 'BelongsTo';
 ```
 
 Queries in Rust:
 
 ```rust
-// All nodes of a project
+// All children of a project (M1: single parent_id)
 fn query_children(parent_id: &str) -> Vec<Entity> {
   db.query(
     "SELECT entity_id FROM components
      WHERE component_type = 'BelongsTo'
-     AND json_extract(data, '$.parent_ids') LIKE ?",
-    [format!("%{}%", parent_id)]
+     AND json_extract(data, '$.parent_id') = ?",
+    [parent_id]
+  )
+}
+
+// All children of a project (future: parent_ids array)
+fn query_children(parent_id: &str) -> Vec<Entity> {
+  db.query(
+    "SELECT c.entity_id FROM components c, json_each(c.data, '$.parent_ids') j
+     WHERE c.component_type = 'BelongsTo' AND j.value = ?",
+    [parent_id]
   )
 }
 
@@ -250,7 +264,7 @@ fn query_running() -> Vec<Entity> {
 | Component | Data | Purpose |
 |-----------|------|---------|
 | `Label` | `{ text, icon, color }` | Display in UI |
-| `BelongsTo` | `{ parent_ids: [] }` | Hierarchy |
+| `BelongsTo` | `{ parent_id }` (M1) / `{ parent_ids: [] }` (future) | Hierarchy |
 | `Order` | `{ index }` | Order among siblings |
 | `Project` | `{ cwd }` | Root node |
 | `Pty` | `{ cmd, cwd, env }` | Terminal/TUI process |
@@ -258,12 +272,14 @@ fn query_running() -> Vec<Entity> {
 | `Editor` | `{ kind, port, cwd }` | code-server etc |
 | `Agent` | `{ model, system_prompt }` | LLM agent |
 | `ContextOf` | `{ node_ids: [] }` | Agent can see these nodes |
-| `Docker` | `{ compose_path }` | Docker compose |
+| `Docker` | `{ compose_path, auto_up }` | Docker compose |
 | `Running` | `{ pid, started_at }` | Live process |
 | `Crashed` | `{ exit_code, stderr_tail }` | Crashed process |
 | `RestoreOnStart` | `{}` | Restore on app launch |
 | `Pinned` | `{}` | Don't kill on project kill |
+| `Layout` | `{ tree: LayoutNode }` | Full layout tree (on project entities) |
 | `LayoutLeaf` | `{ pane_id }` | Position in layout |
+| `LayoutVisible` | `{ workspace_id }` | Which workspace entity is visible in |
 
 ---
 
@@ -280,15 +296,15 @@ PersistSystem      — debounced write of changes to SQLite
 
 ---
 
-## Migration from v1 (pure tree)
+## Starting Simple (M1 → multi-parent later)
 
-If v1 starts as a pure tree (`parent_id: string | null`), migrating to the hybrid is:
+M1 uses single-parent `BelongsTo: { parent_id }`. The ECS schema is in place from day one — the only simplification is one parent instead of many. Upgrading to multi-parent later requires:
 
-1. Rename `parent_id` → `parent_ids: string[]`
+1. Change `BelongsTo` data from `{ parent_id }` to `{ parent_ids: [] }`
 2. Update `buildTree()` — handle multiple parents
-3. Update UI — display shared nodes
+3. Update UI — display shared nodes with a visual badge
 
-The storage schema barely changes. This is a deliberate decision — start with single-parent, but don't bake that constraint in deeply.
+The storage schema does not change. This is a deliberate decision — start with single-parent, but the ECS storage layer doesn't bake that constraint in.
 
 ---
 
