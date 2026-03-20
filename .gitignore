@@ -1,0 +1,42 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Node
+node_modules/
+dist/
+.output/
+
+# Tauri
+src-tauri/target/
+src-tauri/gen/
+*.app
+*.dmg
+*.msi
+*.deb
+*.AppImage
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# SQLite
+*.db
+*.db-journal
+*.db-wal
