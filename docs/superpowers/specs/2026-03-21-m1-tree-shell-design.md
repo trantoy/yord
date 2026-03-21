@@ -84,7 +84,9 @@ CREATE INDEX idx_belongs_to ON components(component_type, json_extract(data, '$.
 - `SQLITE_OPEN_NO_MUTEX` on all connections (we guarantee single-thread access)
 - Reader connections opened with `SQLITE_OPEN_READ_ONLY` (defense in depth)
 - Simple append-only migration system with `_migrations` version table
+- Use `INSERT OR REPLACE` / `ON CONFLICT` for idempotent component upserts (prevents constraint error spam)
 - Verify bundled SQLite >= 3.51.3 (WAL-reset data race fix)
+- On startup: if WAL file exists and is large (>1MB), run checkpoint before `integrity_check` to recover data first
 - Run `PRAGMA wal_checkpoint(TRUNCATE)` on writer during shutdown
 
 ### 3.2 M1 Components
@@ -162,10 +164,13 @@ M1 implementations: `SqliteEntityStore`, `PortablePtyBackend`, `UnixProcessManag
 - Wrap reader thread body in `std::panic::catch_unwind` — on panic, still clean up PTY state and send exit notification
 - Kill flag (`Arc<AtomicBool>`) + `ChildKiller` handle for clean shutdown
 - Implement `Drop` on PTY handle with 100ms graceful kill timeout as defense-in-depth
-- Respect `$SHELL`, launch as interactive shell by default
-- Remove `npm_config_prefix` env, filter `CLAUDECODE*` env vars
+- **Shell detection fallback chain:** `$SHELL` → `/etc/passwd` entry → `/bin/sh` (Unix) / `COMSPEC` → `cmd.exe` (Windows). Validate shell exists before spawn.
+- Set `TERM=xterm-256color` and `TERM_PROGRAM=yord` in PTY environment
+- Remove `npm_config_prefix` env, filter `CLAUDECODE*`, `ALACRITTY_*`, stale terminal-specific env vars
 - macOS PATH augmentation (`~/.cargo/bin`, Homebrew paths, nvm/fnm)
+- **Windows PATH:** inherit current PATH as-is, do not reconstruct. Expand `%VAR%` syntax in `Pty.cwd`/`Pty.cmd`. Handle `PATHEXT` empty entries (`;;`). Normalize paths (backslashes, valid drive letter).
 - EIO handling: macOS `ErrorKind::Other`, Linux `BrokenPipe` — both are normal EOF
+- **Input vs output backpressure:** Never drop user input (writes to PTY stdin). Backpressure applies only to PTY output (reads from stdout). Write path must be unbuffered or flushed immediately.
 
 ### 5.3 PTY Output Streaming
 
@@ -233,6 +238,12 @@ Per-entity kill sequence (PTY — two-step, from zed):
 
 Non-shell processes (Docker, agents): `SIGTERM` with 5s timeout.
 
+**Windows kill sequence:** `GenerateConsoleCtrlEvent(CTRL_C_EVENT)` → wait → `TerminateProcess`. Verify Job Object assignment with `IsProcessInJob()` after spawn. Note: `TerminateProcess` returns nonzero on *success* (wezterm has an inverted error check bug here — write fresh with correct semantics).
+
+**SIGHUP handler on Yord process:** Install a handler so external SIGHUP (e.g., from a parent terminal) triggers clean shutdown (kill propagation + WAL checkpoint), not abrupt exit.
+
+**After SIGKILL:** Call `waitpid` (blocking, short timeout) to reap zombies. The `try_wait()` polling handles the grace period, but after SIGKILL do a final blocking reap.
+
 ### 5.6 App Shutdown
 
 - Custom quit handler + `RunEvent::ExitRequested` (Tauri's default Quit skips destructors)
@@ -243,7 +254,7 @@ Non-shell processes (Docker, agents): `SIGTERM` with 5s timeout.
 
 See `docs/research/storage/session-restore.md` for exhaustive edge case table.
 
-**Phase 1 (0–200ms):** Load entities from SQLite. Run `PRAGMA integrity_check` (if corrupt, copy to `.bak`, start fresh). Show tree with skeleton UI. Use `tauri-plugin-window-state` for window geometry restore.
+**Phase 1 (0–200ms):** Load entities from SQLite. Run `PRAGMA integrity_check` (if corrupt, copy to `.bak`, start fresh). Check `_migrations` max version — if DB is from a newer Yord version, show error and optionally start fresh with backup. If `Order.index` values have gaps/duplicates, re-normalize. Show tree with skeleton UI. Use `tauri-plugin-window-state` for window geometry restore (on Wayland: position restore is a no-op, restore size only).
 
 **Phase 2 (200ms–1s):** Stale PID cleanup:
 - Store `(pid, started_at)` pairs — `kill(pid, 0)` only tells you a process exists, not that it's YOURS. Compare `started_at` against `/proc/<pid>/stat` start time on Linux. If mismatch, treat as dead.
@@ -257,7 +268,9 @@ See `docs/research/storage/session-restore.md` for exhaustive edge case table.
 - **Default shell detection:** If `Pty.cmd` matches previously-detected default shell, use CURRENT `$SHELL` instead (don't hardcode paths).
 - **Bounded concurrency:** Semaphore (4 concurrent spawns) to prevent thundering herd. Priority: focused → visible → background.
 - **Per-entity mutex** to prevent double-spawn race (user clicks "start" during Phase 3).
-- **Crash loop prevention:** If process exits within <2s of spawn during restore, don't auto-restart. Show as `Crashed`.
+- **Per-entity `catch_unwind`** around each entity's restore — one bad entity must not crash the entire restore.
+- **Crash loop prevention:** If process exits within <2s of spawn during restore, don't auto-restart. Show as `Crashed`. Also check if the port it was using is already bound — provide specific error: "Port 3000 already in use."
+- If `Pty.cmd` is not a shell and not found on PATH, fall back to spawning the default shell in the same CWD rather than showing `Crashed`.
 - Filter session-specific env vars on restore: `TERM_SESSION_ID`, `TMUX`, `STY`, `WINDOWID`, `SHELL_SESSION_ID`.
 
 **Phase 4 (5s+):** `PRAGMA optimize`. Show restore summary toast: "5 terminals restored, 1 failed (missing directory)".
@@ -334,13 +347,13 @@ See `docs/research/frontend/flat-to-tree.md` for full `buildTree()` implementati
 ### 7.2 Terminal View
 
 - All xterm.js instances in main Svelte webview (no separate Tauri webviews)
-- Renderer fallback: WebGL → Canvas → DOM
+- Renderer fallback: WebGL → Canvas → DOM. Handle `webglcontextlost` event at runtime — fall back to Canvas renderer on context loss (macOS sleep, GPU driver reset). Re-attempt WebGL after delay.
 - Lazy instantiation (only visible terminals get DOM-mounted)
 - `@xterm/addon-fit`, `@xterm/addon-search` (`Cmd+F`)
 - Default scrollback: 5,000 lines
 - Ship bundled monospace font (system monospace fallback)
 - **Escape sequence filtering (two-layer defense)** — see `docs/research/pty/escape-filtering.md`:
-  - **Layer 1 (Rust, `vte` crate):** Strip CSI 20t/21t (title reports, RCE vector), all window manipulation CSI t, DCS sequences, DECRQSS. Validate OSC 7 (file: protocol only, 1024 byte cap). Block OSC 52 clipboard queries. Enforce OSC 52 size limits (75KB decoded, 128KB raw).
+  - **Layer 1 (Rust, `vte` crate):** Strip CSI 20t/21t (title reports, RCE vector), all window manipulation CSI t, DCS sequences (except XTGETTCAP — allow through for terminal capability detection by programs like Neovim), DECRQSS. Validate OSC 7 (file: protocol only, 1024 byte cap). Block OSC 52 clipboard queries. Enforce OSC 52 size limits (75KB decoded, 128KB raw). Document specific ConPTY artifact sequences to filter on Windows.
   - **Layer 2 (xterm.js handlers):** OSC 52 focus gating (only write clipboard when terminal focused) + user notification. OSC 7 CWD tracking. Paste de-fanging (strip bracketed paste markers `\x1b[200~`/`\x1b[201~` from clipboard content).
 
 ### 7.3 Focus & Keyboard
@@ -459,10 +472,13 @@ Linux, Windows, macOS, Android, iOS. Browser deferred.
 - `docs/research/pty/` — actor patterns, output buffering, escape filtering
 - `docs/research/storage/` — SQLite single-writer, session restore edge cases
 - `docs/research/frontend/` — flat-to-tree (buildTree) implementation
+- `docs/research/from-issues/known-pitfalls.md` — 30+ pitfalls with spec coverage analysis
+- `docs/research/from-issues/spec-validation.md` — 592 issues cross-referenced against 8 design decisions
+- `docs/research/from-issues/cross-platform.md` — 75 platform-specific bugs (Windows, macOS, Linux)
 - `docs/refs/report.md` — 9 reference project survey
 - `docs/refs/projects/` — per-project deep research
 
 ---
 
-*Spec version 2.0 — 2026-03-21*
-*Updated with findings from 7 research dives (actor patterns, output buffering, escape filtering, flat-to-tree, session restore, SQLite single-writer, taurpc compatibility)*
+*Spec version 3.0 — 2026-03-21*
+*v2: 7 research dives. v3: 592-issue cross-reference, 30+ pitfall catalog, 75 platform bugs*
