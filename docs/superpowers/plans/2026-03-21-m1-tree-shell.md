@@ -493,7 +493,7 @@ fn open_connection(path: &Path, readonly: bool) -> rusqlite::Result<Connection> 
     Ok(conn)
 }
 
-type WriteFn = Box<dyn FnOnce(&Connection) + Send + 'static>;
+type WriteFn = Box<dyn FnOnce(&mut Connection) + Send + 'static>;
 
 #[derive(Clone)]
 pub struct Database {
@@ -511,7 +511,7 @@ impl Database {
         std::thread::Builder::new()
             .name("yord-db-writer".into())
             .spawn(move || {
-                let conn = open_connection(&writer_path, false)
+                let mut conn = open_connection(&writer_path, false)
                     .expect("Failed to open writer connection");
                 conn.execute_batch(DB_INIT_PRAGMAS)
                     .expect("Failed to set DB init pragmas");
@@ -522,7 +522,7 @@ impl Database {
                 info!("Database writer thread started");
 
                 while let Some(f) = write_rx.blocking_recv() {
-                    f(&conn);
+                    f(&mut conn);
                 }
 
                 // Shutdown: checkpoint WAL
@@ -544,7 +544,7 @@ impl Database {
 
     pub async fn read<F, T>(&self, f: F) -> T
     where
-        F: FnOnce(&Connection) -> T + Send + 'static,
+        F: FnOnce(&mut Connection) -> T + Send + 'static,
         T: Send + 'static,
     {
         let db = self.clone();
@@ -555,12 +555,12 @@ impl Database {
 
     pub async fn write<F, T>(&self, f: F) -> T
     where
-        F: FnOnce(&Connection) -> T + Send + 'static,
+        F: FnOnce(&mut Connection) -> T + Send + 'static,
         T: Send + 'static,
     {
         let (result_tx, result_rx) = oneshot::channel();
         self.write_tx
-            .send(Box::new(move |conn| {
+            .send(Box::new(move |conn: &mut Connection| {
                 let result = f(conn);
                 let _ = result_tx.send(result);
             }))
@@ -749,7 +749,7 @@ impl EntityStore for SqliteEntityStore {
         let entity = Entity::new();
         let id = entity.id.clone();
 
-        self.db.write(move |conn| {
+        self.db.write(move |conn: &mut Connection| {
             let tx = conn.transaction()?;
             tx.execute(
                 "INSERT INTO entities (id, created_at, updated_at) VALUES (?1, ?2, ?3)",
@@ -881,6 +881,67 @@ impl EntityStore for SqliteEntityStore {
             )
         }).await?;
         Ok(())
+    }
+
+    async fn query_by_component(&self, comp_type: &str) -> Result<Vec<EntityWithComponents>, YordError> {
+        let comp_type = comp_type.to_string();
+        self.db.read(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT e.id, e.created_at, e.updated_at
+                 FROM entities e
+                 JOIN components c ON e.id = c.entity_id
+                 WHERE c.component_type = ?1"
+            )?;
+            let entity_ids: Vec<(String, i64, i64)> = stmt
+                .query_map(params![comp_type], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            let mut comp_stmt = conn.prepare(
+                "SELECT component_type, data FROM components WHERE entity_id = ?1"
+            )?;
+            let mut result = Vec::with_capacity(entity_ids.len());
+            for (id, created_at, updated_at) in entity_ids {
+                let components: HashMap<String, serde_json::Value> = comp_stmt
+                    .query_map(params![id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+                    .filter_map(|r| r.ok())
+                    .map(|(ct, data)| (ct, serde_json::from_str(&data).unwrap_or_default()))
+                    .collect();
+                result.push(EntityWithComponents { id, created_at, updated_at, components });
+            }
+            Ok(result)
+        }).await
+    }
+
+    async fn query_children(&self, parent_id: &str) -> Result<Vec<EntityWithComponents>, YordError> {
+        let parent_id = parent_id.to_string();
+        self.db.read(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT e.id, e.created_at, e.updated_at
+                 FROM entities e
+                 JOIN components c ON e.id = c.entity_id
+                 WHERE c.component_type = 'BelongsTo'
+                   AND json_extract(c.data, '$.parent_id') = ?1"
+            )?;
+            let entity_ids: Vec<(String, i64, i64)> = stmt
+                .query_map(params![parent_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            let mut comp_stmt = conn.prepare(
+                "SELECT component_type, data FROM components WHERE entity_id = ?1"
+            )?;
+            let mut result = Vec::with_capacity(entity_ids.len());
+            for (id, created_at, updated_at) in entity_ids {
+                let components: HashMap<String, serde_json::Value> = comp_stmt
+                    .query_map(params![id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+                    .filter_map(|r| r.ok())
+                    .map(|(ct, data)| (ct, serde_json::from_str(&data).unwrap_or_default()))
+                    .collect();
+                result.push(EntityWithComponents { id, created_at, updated_at, components });
+            }
+            Ok(result)
+        }).await
     }
 }
 ```
@@ -1395,8 +1456,8 @@ import type { TreeNode } from "../types/tree";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 
 // Use $state.raw() — no deep proxy (5,000x perf cliff with $state())
-let entities = $state.raw<EntityWithComponents[]>([]);
-let tree = $state.raw<TreeNode[]>([]);
+let entities: EntityWithComponents[] = $state.raw([]);
+let tree: TreeNode[] = $state.raw([]);
 let selectedId = $state<string | null>(null);
 
 let unlisteners: UnlistenFn[] = [];
