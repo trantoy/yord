@@ -6,7 +6,9 @@
 
 **Architecture:** Tauri 2 (Rust) + Svelte 5 (TS) with ECS storage (SQLite, entities + components tables). Per-PTY Tokio actor pattern with ring buffer output streaming. Two-layer escape sequence filtering. Progressive 4-phase session restore.
 
-**Tech Stack:** Rust, Svelte 5, TypeScript, Tauri 2, rusqlite, portable-pty 0.9+, xterm.js, vte, tracing, thiserror, uuid v7, close-fds, sysinfo
+**Tech Stack:** Rust (MSRV 1.75+ for RPITIT), Svelte 5, TypeScript, Tauri 2, rusqlite, portable-pty 0.9+, xterm.js, vte, tracing, thiserror, uuid v7, close-fds, sysinfo
+
+**Wire format convention:** snake_case everywhere (Rust structs, JSON on the wire, TypeScript types). No `serde(rename_all)` — keep it simple. TypeScript types mirror the Rust naming.
 
 **Spec:** `docs/superpowers/specs/2026-03-21-m1-tree-shell-design.md`
 
@@ -31,18 +33,20 @@ Produces: A Tauri 2 app with blank window, SQLite database, entity CRUD via IPC,
 - Modify: `src-tauri/tauri.conf.json` (CSP, window config)
 - Modify: `src-tauri/capabilities/default.json` (permissions)
 
-- [ ] **Step 1: Create Tauri app**
+- [ ] **Step 1: Create Tauri app in a temp directory, then copy scaffold files in**
 
 ```bash
-cd /home/fox/projects/yord
-bun create tauri-app . --template svelte-ts --manager bun
-```
-
-If the directory isn't empty (docs exist), move docs out, scaffold, move back:
-```bash
-mv docs /tmp/yord-docs && mv CLAUDE.md AGENTS.md CHANGELOG.md CONTRIBUTING.md LICENSE-MIT LICENSE-APACHE README.md .editorconfig .gitattributes .gitignore /tmp/yord-docs/
-bun create tauri-app . --template svelte-ts --manager bun
-mv /tmp/yord-docs/docs . && mv /tmp/yord-docs/CLAUDE.md /tmp/yord-docs/AGENTS.md /tmp/yord-docs/CHANGELOG.md /tmp/yord-docs/CONTRIBUTING.md /tmp/yord-docs/LICENSE-MIT /tmp/yord-docs/LICENSE-APACHE /tmp/yord-docs/README.md /tmp/yord-docs/.editorconfig /tmp/yord-docs/.gitattributes /tmp/yord-docs/.gitignore .
+bun create tauri-app /tmp/yord-scaffold --template svelte-ts --manager bun
+# Copy scaffold files into existing project (don't overwrite docs, licenses, etc.)
+cp -r /tmp/yord-scaffold/src-tauri /home/fox/projects/yord/
+cp -r /tmp/yord-scaffold/src /home/fox/projects/yord/
+cp /tmp/yord-scaffold/package.json /home/fox/projects/yord/
+cp /tmp/yord-scaffold/tsconfig.json /home/fox/projects/yord/
+cp /tmp/yord-scaffold/vite.config.ts /home/fox/projects/yord/
+cp /tmp/yord-scaffold/svelte.config.js /home/fox/projects/yord/
+# Merge .gitignore entries from scaffold into existing .gitignore
+rm -rf /tmp/yord-scaffold
+cd /home/fox/projects/yord && bun install
 ```
 
 - [ ] **Step 2: Add Rust dependencies to `src-tauri/Cargo.toml`**
@@ -62,12 +66,19 @@ tokio = { version = "1", features = ["full"] }
 thread_local = "1"
 ```
 
-- [ ] **Step 3: Add frontend dependencies**
+- [ ] **Step 3: Add frontend dependencies + bundled font**
 
 ```bash
 cd /home/fox/projects/yord
-bun add @xterm/xterm @xterm/addon-fit @xterm/addon-search @xterm/addon-canvas @xterm/addon-webgl
+bun add @xterm/xterm @xterm/addon-fit @xterm/addon-search @xterm/addon-canvas @xterm/addon-webgl @fontsource/jetbrains-mono
 ```
+
+Import the font in `src/app.css` or `src/App.svelte`:
+```css
+@import "@fontsource/jetbrains-mono";
+```
+
+xterm.js will use it via `fontFamily: "'JetBrains Mono', monospace"` in terminal options.
 
 - [ ] **Step 4: Configure CSP in `src-tauri/tauri.conf.json`**
 
@@ -1061,23 +1072,22 @@ fn main() {
         )
         .init();
 
-    let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
-
-    let db = rt.block_on(async {
-        let app_dir = dirs::data_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join("yord");
-        std::fs::create_dir_all(&app_dir).ok();
-        let db_path = app_dir.join("yord.db");
-        info!(?db_path, "Opening database");
-        Database::open(db_path).await.expect("Failed to open database")
-    });
-
-    let store = SqliteEntityStore::new(db);
-
     tauri::Builder::default()
         .plugin(tauri_plugin_window_state::Builder::new().build())
-        .manage(store)
+        .setup(|app| {
+            let app_dir = app.path().app_data_dir().expect("Failed to get app data dir");
+            std::fs::create_dir_all(&app_dir).ok();
+            let db_path = app_dir.join("yord.db");
+            info!(?db_path, "Opening database");
+
+            let db = tauri::async_runtime::block_on(
+                Database::open(db_path)
+            ).expect("Failed to open database");
+
+            let store = SqliteEntityStore::new(db);
+            app.manage(store);
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             commands::create_entity,
             commands::delete_entity,
@@ -1090,7 +1100,7 @@ fn main() {
 }
 ```
 
-Add `dirs = "5"` to Cargo.toml.
+No extra crate needed — use Tauri's `app.path().app_data_dir()` in the builder setup.
 
 - [ ] **Step 4: Add event emission to commands**
 
@@ -1144,7 +1154,46 @@ export interface EntityWithComponents {
   id: string;
   created_at: number;
   updated_at: number;
+  /** Raw component data from Rust. Keys are component type names, values are JSON objects.
+   *  Use the helper functions below for typed access. */
   components: Record<string, unknown>;
+}
+
+// --- Typed component accessors ---
+// The wire format from Rust sends components as Record<string, serde_json::Value>.
+// These helpers provide type-safe access without a full deserializer.
+
+export interface LabelData { text: string; icon?: string; color?: string }
+export interface BelongsToData { parent_id: string }
+export interface OrderData { index: number }
+export interface ProjectData { cwd: string }
+export interface PtyData { cmd: string[]; cwd: string; env?: Record<string, string> }
+export interface RunningData { pid: number; pgid: number; started_at: number }
+export interface CrashedData { exit_code: number; stderr_tail: string }
+
+export function getLabel(e: EntityWithComponents): LabelData | undefined {
+  return e.components.Label as LabelData | undefined;
+}
+export function getBelongsTo(e: EntityWithComponents): BelongsToData | undefined {
+  return e.components.BelongsTo as BelongsToData | undefined;
+}
+export function getOrder(e: EntityWithComponents): OrderData | undefined {
+  return e.components.Order as OrderData | undefined;
+}
+export function getProject(e: EntityWithComponents): ProjectData | undefined {
+  return e.components.Project as ProjectData | undefined;
+}
+export function getPty(e: EntityWithComponents): PtyData | undefined {
+  return e.components.Pty as PtyData | undefined;
+}
+export function getRunning(e: EntityWithComponents): RunningData | undefined {
+  return e.components.Running as RunningData | undefined;
+}
+export function getCrashed(e: EntityWithComponents): CrashedData | undefined {
+  return e.components.Crashed as CrashedData | undefined;
+}
+export function hasComponent(e: EntityWithComponents, type: string): boolean {
+  return type in e.components;
 }
 
 export type ComponentData =
@@ -1701,21 +1750,57 @@ Reference: `docs/research/pty/actor-patterns.md` for full design.
 
 ---
 
-### Task 17: TerminalView Component (xterm.js)
+### Task 17a: TerminalView — Basic xterm.js Rendering
 
 **Files:**
 - Create: `src/components/views/TerminalView.svelte`
+- Create: `src/components/views/ErrorBoundary.svelte`
 - Modify: `src/App.svelte` (show TerminalView when terminal selected)
 
-- [ ] **Step 1: Create TerminalView.svelte** — xterm.js instance with FitAddon, SearchAddon, renderer fallback (WebGL → Canvas → DOM), webglcontextlost handler
-- [ ] **Step 2: Wire Channel** — on mount, invoke `start_entity` with Channel, write data to xterm.js on `onmessage`
-- [ ] **Step 3: Wire input** — `terminal.onData()` → `pty_write`
-- [ ] **Step 4: Wire resize** — FitAddon + ResizeObserver (debounced 100ms) → `pty_resize`
-- [ ] **Step 5: Wire cleanup** — on destroy, delete `channel.onmessage`, unlisten all handlers
-- [ ] **Step 6: Add error boundary wrapper**
-- [ ] **Step 7: Add xterm.js parser handlers** — OSC 52 focus gating, OSC 7 CWD tracking, paste de-fanging
-- [ ] **Step 8: Test** — create project + terminal in tree, click terminal, type `ls`, see output
-- [ ] **Step 9: Commit**
+- [ ] **Step 1: Create ErrorBoundary.svelte** — wraps children in try/catch, shows "Terminal error — click to restart" fallback on error
+- [ ] **Step 2: Create TerminalView.svelte** — xterm.js instance with FitAddon, renderer fallback (WebGL → Canvas → DOM), `webglcontextlost` handler to fall back to Canvas at runtime. Use bundled JetBrains Mono font. Default scrollback 5,000.
+- [ ] **Step 3: Wire Channel** — on mount, invoke `start_entity` with Channel, write data to xterm.js on `onmessage`. Follow channel teardown protocol: on exit event, delete `channel.onmessage`.
+- [ ] **Step 4: Update App.svelte** — show TerminalView when a terminal node is selected in the tree
+- [ ] **Step 5: Test** — create project + terminal, click terminal, verify xterm.js renders
+- [ ] **Step 6: Commit**
+
+```bash
+git commit -m "feat: add TerminalView with xterm.js, renderer fallback, error boundary"
+```
+
+---
+
+### Task 17b: TerminalView — Input, Resize, Cleanup
+
+**Files:**
+- Modify: `src/components/views/TerminalView.svelte`
+
+- [ ] **Step 1: Wire input** — `terminal.onData()` → `pty_write` (never buffer/drop user input)
+- [ ] **Step 2: Wire resize** — FitAddon + ResizeObserver (debounced 100ms) → `pty_resize`. Send fresh resize when terminal becomes visible.
+- [ ] **Step 3: Wire cleanup** — on destroy, delete `channel.onmessage`, unlisten all handlers, dispose xterm.js instance
+- [ ] **Step 4: Test** — type `ls`, see output. Resize window, verify terminal adapts. Close terminal, verify no leaked listeners.
+- [ ] **Step 5: Commit**
+
+```bash
+git commit -m "feat: wire terminal input, resize, and cleanup"
+```
+
+---
+
+### Task 17c: TerminalView — Security Handlers
+
+**Files:**
+- Modify: `src/components/views/TerminalView.svelte`
+
+- [ ] **Step 1: Add xterm.js parser handlers** — OSC 52 focus gating (clipboard write only when focused, with size limit), OSC 7 CWD tracking (validate `file:` protocol, update entity component)
+- [ ] **Step 2: Add paste de-fanging** — strip bracketed paste markers (`\x1b[200~`/`\x1b[201~`) from clipboard content before sending to PTY
+- [ ] **Step 3: Add SearchAddon** — bind `Cmd+F` / `Ctrl+F` to open search within terminal pane
+- [ ] **Step 4: Test** — verify search works, verify paste doesn't include escape sequences
+- [ ] **Step 5: Commit**
+
+```bash
+git commit -m "feat: add terminal security handlers, search, paste de-fanging"
+```
 
 ---
 
@@ -1828,13 +1913,15 @@ Phase 3 (PTY engine):
   T11 + T12 + T13 → T14 (PTY spawn)
   T14 → T15 (actor)
   T15 → T16 (Tauri PTY commands)
-  T16 + T10 → T17 (TerminalView)
+  T16 + T10 → T17a (TerminalView basic)
+  T17a → T17b (input/resize/cleanup)
+  T17b → T17c (security handlers)
 
 Phase 4 (lifecycle):
   T16 → T18 (kill propagation)
   T18 → T19 (shutdown handlers)
   T19 → T20 (session restore)
-  T20 + T17 → T21 (CI + polish)
+  T20 + T17c → T21 (CI + polish)
 ```
 
 Tasks T11, T12, T13 can run in parallel (independent). T8 can start as soon as T7 is done, even while Phase 3 tasks are in progress.
@@ -1855,7 +1942,7 @@ Tasks T11, T12, T13 can run in parallel (independent). T8 can start as soon as T
 - **`tempfile::TempDir`** in tests instead of `NamedTempFile` (Windows compatibility).
 - **DEC 2026 sync output** — xterm.js handles this internally. The ring buffer flush timer in the actor does NOT need to track it. Spec should be updated to clarify this.
 - **`PersistSystem` and `LifecycleSystem`** are not separate structs in this plan. Logic is distributed across Tauri commands and the actor loop. This is a valid simplification for M1.
-- **Drag-to-reorder and drag-to-reparent** are spec features not covered by this plan. Add as a follow-up task after M1 core is working.
+- **Drag-to-reorder and drag-to-reparent** (spec section 7.1) are explicitly deferred to a follow-up task after M1 core is working. They require DnD implementation + Order/BelongsTo component updates — straightforward but not on the critical path.
 - **Add `sysinfo` crate to Cargo.toml** if implementing foreground process tracking or PID validation via `/proc`.
 - **Add `vitest.config.ts`** with Svelte preprocessor for `.svelte.ts` files.
 - **Tasks 14, 15, 17, 20 are dense** — implementers should split them further during execution if needed.
