@@ -273,7 +273,7 @@ fn query_running() -> Vec<Entity> {
 | `Agent` | `{ model, system_prompt }` | LLM agent |
 | `ContextOf` | `{ node_ids: [] }` | Agent can see these nodes |
 | `Docker` | `{ compose_path, auto_up }` | Docker compose |
-| `Running` | `{ pid, started_at }` | Live process |
+| `Running` | `{ pid, pgid, started_at }` | Live process |
 | `Crashed` | `{ exit_code, stderr_tail }` | Crashed process |
 | `RestoreOnStart` | `{}` | Restore on app launch |
 | `Pinned` | `{}` | Don't kill on project kill |

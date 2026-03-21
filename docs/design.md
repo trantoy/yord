@@ -132,7 +132,7 @@ ContextOf:     { node_ids: string[] }           // agent sees these nodes
 Docker:        { compose_path: string, auto_up: boolean }
 
 // Lifecycle
-Running:       { pid: number, started_at: number }
+Running:       { pid: number, pgid: number, started_at: number }
 Crashed:       { exit_code: number, stderr_tail: string }
 RestoreOnStart: {}
 Pinned:        {}
@@ -208,14 +208,25 @@ Runtime state (pid, port) lives in `Running` components, not a separate sessions
 
 Entities with the `Pinned` component are skipped.
 
+**Process group kill**: Signals are sent to the entire process group (`kill(-pgid, SIGTERM)`), not just the shell PID. This ensures child processes (e.g., `node server.js` spawned by `npm run dev`) are killed too. Sequence per entity:
+1. Send `SIGTERM` to process group
+2. Wait configurable timeout (default 5s, Docker gets more)
+3. Send `SIGKILL` to process group if still alive
+4. Remove `Running` component only after confirmed process exit
+
+**Crash safety**: On Linux, child processes are spawned with `PR_SET_PDEATHSIG(SIGTERM)` so they die if the Yord process crashes. On Windows, Job Objects group child processes for reliable cleanup. PIDs/PGIDs are persisted in SQLite so the next launch can detect and clean up orphans.
+
 ### 6.2 Session Restore
 
-On application start:
-1. Load all entities and components from SQLite
-2. For each entity with `RestoreOnStart` component that also has a `Running` component (from previous session): spawn process
-3. Assign new PIDs, update `Running` components
-4. Reconstruct layout from `Layout` components on project entities
-5. Open the last active workspace
+Progressive restore on application start:
+
+**Phase 1 (0–200ms):** Load entities from SQLite. Restore window geometry. Show tree panel with skeleton UI. Window starts hidden, shows after layout is ready.
+
+**Phase 2 (200ms–1s):** Stale PID cleanup — check each `Running` component's PID (`kill(pid, 0)` on Unix, `OpenProcess` on Windows). If dead, remove `Running` and add `Crashed` if exit was non-zero. Spawn the focused/active terminal only.
+
+**Phase 3 (1–5s):** For remaining entities with `RestoreOnStart`: validate `Pty.cwd` exists and `Pty.cmd` is on PATH. If valid, spawn. If invalid, show error in tree (don't silently skip). Assign new PIDs/PGIDs, update `Running` components.
+
+**Phase 4 (5s+):** Run `PRAGMA optimize` on SQLite.
 
 Entities that crashed in the previous session (have `Crashed` component) are shown as crashed — user must manually restart.
 
@@ -236,15 +247,52 @@ Web-based entities (editor, filebrowser) need a port. Yord manages a port pool:
 
 | Layer | Technology | Reason |
 |-------|-----------|--------|
-| UI framework | Svelte 5 | Minimal overhead, fine-grained reactivity, no vdom |
+| UI framework | Svelte 5 + TypeScript | Minimal overhead, fine-grained reactivity, no vdom |
 | Desktop shell | Tauri 2 | Rust core, native webview, no Chromium bundle |
 | Backend | Rust | Process management, PTY, file system, SQLite |
 | Terminal renderer | xterm.js | Industry standard, handles all TUI apps |
-| PTY bridge | portable-pty (Rust crate) | Cross-platform PTY, clean Tauri command API |
-| Storage | SQLite via tauri-plugin-sql | Structured, queryable, no external dep |
-| IPC | Tauri commands + events | Typed, bidirectional |
+| PTY bridge | portable-pty (Rust crate) | Cross-platform PTY, from wezterm project |
+| Storage | rusqlite | Direct Rust control, in-memory + WAL persist |
+| IPC (commands) | taurpc + specta | Typed IPC, auto-generates TS types from Rust traits |
+| IPC (streaming) | Tauri 2 Channel\<T\> | High-throughput PTY data, lower overhead than events |
+| Package manager | Bun | Fast installs, native TS execution |
+| CSS | Plain CSS + CSS variables | Scoped Svelte styles, precise layout control |
 
-### 7.2 Process Layers
+### 7.2 Swappable Boundaries (Traits)
+
+Three traits at dependency boundaries. Trait where you'd swap a dep, not at every layer.
+
+```rust
+// Storage — swap SQLite for bevy_ecs, sled, etc.
+trait EntityStore {
+    fn create(&self, components: Vec<ComponentData>) -> Result<EntityId>;
+    fn delete(&self, id: &EntityId) -> Result<()>;
+    fn get(&self, id: &EntityId) -> Result<EntityWithComponents>;
+    fn get_all(&self) -> Result<Vec<EntityWithComponents>>;
+    fn set_component(&self, id: &EntityId, component: ComponentData) -> Result<()>;
+    fn remove_component(&self, id: &EntityId, comp_type: &str) -> Result<()>;
+    fn query(&self, filters: &[ComponentFilter]) -> Result<Vec<EntityWithComponents>>;
+}
+
+// PTY — swap portable-pty for wezterm-term, custom impl, etc.
+trait PtyBackend {
+    fn spawn(&self, cmd: &[String], cwd: &str, env: &HashMap<String, String>) -> Result<PtyHandle>;
+    fn write(&self, handle: &PtyHandle, data: &[u8]) -> Result<()>;
+    fn resize(&self, handle: &PtyHandle, cols: u16, rows: u16) -> Result<()>;
+    fn kill(&self, handle: &PtyHandle) -> Result<()>;
+}
+
+// Process management — swap kill strategy per platform
+trait ProcessManager {
+    fn kill_group(&self, pgid: u32, signal: Signal) -> Result<()>;
+    fn is_alive(&self, pid: u32) -> bool;
+    fn children(&self, pid: u32) -> Result<Vec<u32>>;
+}
+```
+
+M1 implementations: `SqliteEntityStore`, `PortablePtyBackend`, `UnixProcessManager` / `WindowsProcessManager`. Future milestones can swap any of these without touching the rest of the codebase.
+
+### 7.3 Process Layers
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -267,44 +315,133 @@ Web-based entities (editor, filebrowser) need a port. Yord manages a port pool:
            SQLite    OS Processes  PTY
 ```
 
-### 7.3 Tauri Commands (Rust → TS interface)
+### 7.4 Tauri Commands (taurpc trait → auto-gen TS)
 
 ```rust
-// Entity management
-#[tauri::command] fn create_entity(components: Vec<ComponentData>) -> Result<EntityId>
-#[tauri::command] fn delete_entity(id: String) -> Result<()>
-#[tauri::command] fn get_entities() -> Result<Vec<EntityWithComponents>>
+#[taurpc::procedures]
+trait YordApi {
+    // Entity management
+    fn create_entity(components: Vec<ComponentData>) -> Result<EntityId>;
+    fn delete_entity(id: String) -> Result<()>;
+    fn get_entities() -> Result<Vec<EntityWithComponents>>;
 
-// Component management
-#[tauri::command] fn set_component(entity_id: String, component: ComponentData) -> Result<()>
-#[tauri::command] fn remove_component(entity_id: String, component_type: String) -> Result<()>
+    // Component management
+    fn set_component(entity_id: String, component: ComponentData) -> Result<()>;
+    fn remove_component(entity_id: String, component_type: String) -> Result<()>;
 
-// Lifecycle
-#[tauri::command] fn start_entity(id: String) -> Result<()>
-#[tauri::command] fn stop_entity(id: String) -> Result<()>
-#[tauri::command] fn restart_entity(id: String) -> Result<()>
-#[tauri::command] fn kill_project(id: String) -> Result<()>  // recursive stop
+    // Lifecycle
+    fn start_entity(id: String) -> Result<()>;
+    fn stop_entity(id: String) -> Result<()>;
+    fn restart_entity(id: String) -> Result<()>;
+    fn kill_project(id: String) -> Result<()>;  // recursive stop
 
-// PTY (entities with Pty component)
-#[tauri::command] fn pty_write(entity_id: String, data: Vec<u8>) -> Result<()>
-#[tauri::command] fn pty_resize(entity_id: String, cols: u16, rows: u16) -> Result<()>
+    // PTY (entities with Pty component)
+    fn pty_write(entity_id: String, data: Vec<u8>) -> Result<()>;
+    fn pty_resize(entity_id: String, cols: u16, rows: u16) -> Result<()>;
 
-// Port
-#[tauri::command] fn allocate_port() -> Result<u16>
-#[tauri::command] fn release_port(port: u16) -> Result<()>
+    // Port
+    fn allocate_port() -> Result<u16>;
+    fn release_port(port: u16) -> Result<()>;
+}
 ```
 
-### 7.4 Tauri Events (Rust → UI push)
+### 7.5 Tauri Events and Channels (Rust → UI push)
 
 ```rust
-// Emitted to frontend
+// Events (low-frequency state changes)
 "entity:component-changed"  { entity_id, component_type, data }
 "entity:removed"            { entity_id }
-"entity:pty-data"           { entity_id, data: Vec<u8> }
 "entity:port-ready"         { entity_id, port }
+
+// Channels (high-frequency streaming — one Channel<T> per PTY entity)
+// PTY data is NOT sent via events. Each PTY gets a dedicated Tauri 2 Channel
+// that streams batched output directly to a JS callback.
+Channel<PtyOutput> { entity_id, data: Vec<u8> }
 ```
 
 Component changes cover all state transitions — `Running` added means started, `Running` removed means stopped, `Crashed` added means crashed. No separate state-change event needed.
+
+**PTY output batching**: Rust reads PTY in a tight loop on a dedicated thread per entity. Output is accumulated in a ring buffer (256KB per PTY) and flushed to the Channel every 16ms (60fps) or when the buffer exceeds 4KB — whichever comes first. This prevents UI freezes from output floods (e.g., `cat /dev/urandom`, verbose builds).
+
+### 7.6 Implementation Notes (from research)
+
+**PTY spawning:**
+- Use `setsid()` (Linux/macOS) to create a new process group per PTY
+- On Windows, use `CREATE_NEW_PROCESS_GROUP` flag + Job Objects
+- Store both PID and PGID in `Running` component
+- Set `PR_SET_PDEATHSIG(SIGTERM)` on Linux for crash safety
+- Respect `$SHELL` and launch as interactive shell by default
+- PTY reads are blocking — use `spawn_blocking` thread per PTY, never read in async task directly
+- EOF detection differs: Unix drops slave side; Windows needs explicit EOT (`\x04`)
+
+**PTY process management (actor pattern):**
+- Use an actor (mpsc channel) instead of `Arc<Mutex<HashMap>>` for the PTY registry
+- Commands: Spawn, Write, Resize, Kill sent via channel to a single owner task
+- Eliminates lock contention and prevents deadlocks with Tokio runtime
+
+**App shutdown:**
+- Tauri's `MenuItem::Quit` calls `exit(0)` immediately, skipping destructors
+- Must use custom quit handler + `RunEvent::ExitRequested` for cleanup
+- On startup, sweep for orphaned PIDs from previous crashes (stored in SQLite)
+
+**xterm.js:**
+- All terminal instances render in the main Svelte webview (no separate Tauri webviews)
+- Renderer fallback chain: WebGL → Canvas → DOM (WebGL fails on older Linux WebKitGTK)
+- Lazy instantiation: only create xterm.js instance when entity is visible in layout
+- Hidden terminals: PTY output buffered in Rust ring buffer, xterm.js detached from DOM
+- Ship a bundled monospace font (system monospace as fallback)
+- Integrate `@xterm/addon-search` for scrollback search (`Cmd+F` in terminal panes)
+- Default scrollback: 5,000 lines (configurable per entity)
+- **Escape sequence sanitization**: Whitelist allowed sequences. Strip OSC 52 (clipboard write), DECRQSS responses, title set/report, OSC 5113 (Kitty file transfer). Real CVEs with CVSS 9.8 demonstrate RCE via unsanitized terminal output.
+
+**Keyboard:**
+- Global shortcuts use `Cmd`/`Super` key — never intercept `Ctrl+C/D/Z/L/R`
+- Check `event.isComposing` before acting on key events (IME safety)
+- Focus tracked in Svelte store with visual border indicator on active pane
+
+**SQLite (single-writer architecture):**
+- Dedicated writer connection + reader pool (single-writer is ~20x faster than pooled writes)
+- PRAGMAs on every connection:
+  ```sql
+  PRAGMA journal_mode = WAL;
+  PRAGMA synchronous = NORMAL;
+  PRAGMA busy_timeout = 5000;
+  PRAGMA foreign_keys = ON;
+  PRAGMA temp_store = MEMORY;
+  PRAGMA mmap_size = 268435456;
+  PRAGMA cache_size = -16000;
+  ```
+- Use transactions for atomic entity+component persist
+- Verify PIDs alive before persisting `Running` state
+- Verify bundled SQLite ≥ 3.51.3 (WAL-reset data race fix)
+
+**PTY resize:**
+- Debounce resize events (50-100ms) during pane divider drags
+- Send fresh resize when a hidden terminal becomes visible
+
+**Scrollback persistence (future, post-M1):**
+- Rust ring buffer (256KB per PTY) enables re-feeding xterm.js after macOS WKWebView jettison or session restore
+
+**Svelte performance:**
+- Use `$state.raw()` (not `$state()`) for entity/tree data from Rust — deep proxies cause 5,000x slowdown on tree structures
+- Reassign to trigger updates instead of relying on deep reactivity
+- Consider virtual scrolling for large trees (17,000+ nodes in <100ms with flat rendering)
+
+**Tauri security:**
+- Enable CSP in `tauri.conf.json` — not enabled by default, leaving app open to XSS → full IPC access
+- Allow `blob:`, `data:`, `wasm-unsafe-eval` for xterm.js in CSP
+- Audit capability files in `src-tauri/capabilities/` — all are auto-enabled
+
+**Tauri event/channel cleanup:**
+- Every `listen()` and Channel `onmessage` must be cleaned up on component destroy
+- Channel has a known memory leak (#13133): delete `channel.onmessage` explicitly on unmount
+- After 2M events without cleanup, frontend reaches ~1.1GB
+
+**Cross-platform:**
+- Minimum Windows 10 1809+ (ConPTY support)
+- Minimum WebKitGTK 2.42+ recommended for Linux
+- Avoid `backdrop-filter` CSS (broken on WebKitGTK)
+- Test CJK characters and emoji rendering on all platforms
 
 ---
 
@@ -526,7 +663,8 @@ yord/
 │   │   │   ├── mod.rs
 │   │   │   ├── entity.rs      -- Entity struct
 │   │   │   ├── component.rs   -- Component types + ComponentData enum
-│   │   │   └── store.rs       -- EntityStore (in-memory + SQLite)
+│   │   │   ├── traits.rs      -- EntityStore, PtyBackend, ProcessManager traits
+│   │   │   └── store.rs       -- SqliteEntityStore (impl EntityStore)
 │   │   ├── systems/
 │   │   │   ├── mod.rs
 │   │   │   ├── lifecycle.rs   -- LifecycleSystem
@@ -575,4 +713,4 @@ yord/
 
 *Document version: 0.1 — pre-implementation*
 *Stack: Tauri 2 + Svelte 5 + Rust + SQLite*
-*Target platform: macOS first, cross-platform by M3*
+*Target platforms: Linux, Windows, macOS, Android, iOS (browser deferred — see docs/backlog/browser-platform.md)*
