@@ -39,6 +39,7 @@ A desktop app where you create projects, add terminal nodes, and manage everythi
 | IPC streaming | Tauri 2 Channel\<T\> | Per-PTY high-throughput data |
 | Package manager | Bun | Fast installs |
 | CSS | Plain CSS + CSS variables | Scoped Svelte styles |
+| Logging | `tracing` crate | Structured logging, spans for PTY lifecycle |
 
 ---
 
@@ -172,6 +173,12 @@ M1 implementations: `SqliteEntityStore`, `PortablePtyBackend`, `UnixProcessManag
 - EIO handling: macOS `ErrorKind::Other`, Linux `BrokenPipe` — both are normal EOF
 - **Input vs output backpressure:** Never drop user input (writes to PTY stdin). Backpressure applies only to PTY output (reads from stdout). Write path must be unbuffered or flushed immediately.
 
+**Key log points (`tracing` spans and events):**
+- `info` — PTY spawn (entity_id, cmd, cwd, pid, pgid), PTY exit (entity_id, exit_code), restore phase transitions
+- `warn` — backpressure drop (entity_id, bytes dropped), channel broken, stale PID detected, CWD fallback used, crash loop detected
+- `error` — spawn failure, kill failure, SQLite error, integrity check failure
+- `debug` — resize events, component changes, kill propagation steps, actor command dispatch
+
 ### 5.3 PTY Output Streaming
 
 Single async Tokio task per PTY with ring buffer + timer flush. See `docs/research/pty/output-buffering.md` for full design.
@@ -184,6 +191,7 @@ Single async Tokio task per PTY with ring buffer + timer flush. See `docs/resear
 - Raw `Vec<u8>` / `Uint8Array` (not string conversion — handles non-UTF-8)
 - Check `channel.send()` result — if broken (e.g., frontend reload), stop reading and clean up. Don't loop into a dead channel.
 - No socketpair (simpler than wezterm — we don't parse escape sequences on Rust side)
+- **DEC mode 2026 (synchronized output):** Track `CSI ? 2026 h` (begin sync) and `CSI ? 2026 l` (end sync) in the output stream. During sync mode, hold data in the ring buffer instead of flushing on timer — flush only when the end marker arrives. Prevents partial TUI renders (htop, btop flickering).
 
 ### 5.4 PTY Process Management (Per-PTY Actor Pattern)
 
@@ -324,7 +332,9 @@ Note: `start_entity` and `restart_entity` accept a `Channel<Vec<u8>>` parameter 
 Channel<PtyOutput> { entity_id, data: Vec<u8> }
 ```
 
-Cleanup: every `listen()` and Channel `onmessage` cleaned up on component destroy. Delete `channel.onmessage` explicitly (known memory leak #13133).
+**Channel teardown protocol:** When PTY exits, the actor sends a final `PtyEvent::Exited { code }` via the event channel, then drops the Channel sender. Frontend must handle: (1) receive exit event, (2) update entity state (remove `Running`, add `Crashed` if non-zero), (3) delete `channel.onmessage` explicitly (known memory leak #13133), (4) clean up all `listen()` handlers.
+
+Cleanup: every `listen()` and Channel `onmessage` cleaned up on component destroy.
 
 ---
 
@@ -343,6 +353,7 @@ See `docs/research/frontend/flat-to-tree.md` for full `buildTree()` implementati
 - Right-click context menu: start / stop / restart / rename / delete / add child
 - Drag to reorder (updates `Order` component)
 - Drag onto project to reparent (updates `BelongsTo` component)
+- **Confirmation dialog** for destructive actions: delete project (cascades to all children), kill project (stops all children). Show count of affected entities.
 
 ### 7.2 Terminal View
 
@@ -366,7 +377,11 @@ See `docs/research/frontend/flat-to-tree.md` for full `buildTree()` implementati
 
 Tree panel on left, single terminal view on right. Click a terminal node to view it. No tiling/splitting (M2).
 
-### 7.5 Security
+### 7.5 Error Boundaries
+
+Each pane/view should catch errors and show fallback UI (error message + retry button), not crash the whole app. Wrap `TerminalView` and `TreePanel` in Svelte error boundaries. If xterm.js throws, show "Terminal error — click to restart" instead of a blank screen.
+
+### 7.6 Security
 
 - Enable CSP in `tauri.conf.json` — allow `blob:`, `data:`, `wasm-unsafe-eval` for xterm.js
 - Audit capability files in `src-tauri/capabilities/`
@@ -402,8 +417,10 @@ Errors serialized to frontend as JSON string via Tauri's `Result` return type. F
 - **EntityStore**: in-memory `HashMap`-backed implementation of the `EntityStore` trait for unit tests. No SQLite dependency in unit tests.
 - **PtyBackend**: mock implementation that simulates spawn/write/kill without real processes.
 - **Integration tests**: real SQLite + real PTY on CI. Test spawn, write, resize, kill propagation, session restore.
+- **TUI compatibility tests**: verify alternate screen buffer, mouse tracking, and resize with htop, vim, lazygit as baseline targets.
 - **Frontend**: vitest for `buildTree()` logic and store derivations. No E2E in M1.
 - **CI**: GitHub Actions matrix: Ubuntu, macOS, Windows.
+- **`cargo audit`** in CI to catch unmaintained transitive dependencies (tauri-plugin-pty issue #1).
 
 ---
 
@@ -480,5 +497,5 @@ Linux, Windows, macOS, Android, iOS. Browser deferred.
 
 ---
 
-*Spec version 3.0 — 2026-03-21*
-*v2: 7 research dives. v3: 592-issue cross-reference, 30+ pitfall catalog, 75 platform bugs*
+*Spec version 3.1 — 2026-03-21*
+*v2: 7 research dives. v3: 592-issue cross-reference. v3.1: observability, error boundaries, DEC 2026, channel teardown*
