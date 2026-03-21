@@ -1,5 +1,7 @@
 # SQLite Single-Writer + Reader Pool — Reference Research
 
+> Based on analysis of reference projects. All code is pseudocode/sketches — see [docs/refs/README.md](../../refs/README.md) for rules.
+
 Research into how Zed (Rust) and Waveterm (Go) implement SQLite with single-writer architecture. Goal: inform Yord's `rusqlite` setup for Tauri 2.
 
 ---
@@ -42,18 +44,9 @@ There is also a `locking_queue()` alternative used in tests: uses a `parking_lot
 
 Two categories, set separately:
 
-**DB initialization query** (run once on the writer, changes the DB file):
-```sql
-PRAGMA journal_mode=WAL;
-PRAGMA busy_timeout=500;
-PRAGMA case_sensitive_like=TRUE;
-PRAGMA synchronous=NORMAL;
-```
+**DB initialization query** (run once on the writer, changes the DB file): sets `journal_mode=WAL`, `busy_timeout=500`, `case_sensitive_like=TRUE`, and `synchronous=NORMAL`.
 
-**Connection initialization query** (run on every new connection including readers):
-```sql
-PRAGMA foreign_keys=TRUE;
-```
+**Connection initialization query** (run on every new connection including readers): sets `foreign_keys=TRUE`.
 
 The separation matters because `journal_mode=WAL` only needs to be set once (it persists in the file) while `foreign_keys` must be set per-connection (it defaults to OFF each time).
 
@@ -81,13 +74,7 @@ Source: `pkg/wstore/wstore_dbsetup.go`, `pkg/wstore/wstore_dbops.go`, `pkg/util/
 
 ### Connection count and management
 
-**Single connection only.** `SetMaxOpenConns(1)` is called explicitly.
-
-```go
-rtn.DB.SetMaxOpenConns(1)
-```
-
-This is the simplest possible approach: one `sqlx.DB` handle, which Go's `database/sql` internally pools but with `MaxOpenConns=1` it effectively serializes everything. No reader pool. Readers and writers contend for the same connection.
+**Single connection only.** `SetMaxOpenConns(1)` is called explicitly on the `sqlx.DB` handle. Go's `database/sql` internally pools connections, but with max-open-conns set to 1 it effectively serializes everything. No reader pool. Readers and writers contend for the same connection.
 
 The `globalDB` variable is a package-level singleton — `InitWStore()` creates it once at startup.
 
@@ -99,15 +86,7 @@ Transactions are wrapped via `txwrap.WithTx` and `txwrap.WithTxRtn` helpers, whi
 
 ### PRAGMAs
 
-Set via the DSN connection string:
-
-```go
-"file:%s?mode=rwc&_journal_mode=WAL&_busy_timeout=5000"
-```
-
-- `mode=rwc` — read-write-create
-- `_journal_mode=WAL` — WAL mode
-- `_busy_timeout=5000` — 5 second busy timeout (more aggressive than Zed's 500ms)
+Set via the DSN connection string with query parameters: `mode=rwc` (read-write-create), `_journal_mode=WAL`, and `_busy_timeout=5000` (5 second busy timeout, more aggressive than Zed's 500ms).
 
 No `synchronous`, `foreign_keys`, `temp_store`, `mmap_size`, or `cache_size` PRAGMAs are set. This is a minimal configuration.
 
@@ -149,7 +128,7 @@ Waveterm is synchronous Go. No async runtime. All DB calls are blocking. Gorouti
 
 ## Recommended Implementation for Yord
 
-### Architecture
+### Architecture (proposed sketch)
 
 ```
                   Tauri async command
@@ -169,7 +148,7 @@ Waveterm is synchronous Go. No async runtime. All DB calls are blocking. Gorouti
          (read-only)            (read-write)
 ```
 
-### Implementation sketch
+### Implementation sketch (proposed for Yord)
 
 ```rust
 use std::path::{Path, PathBuf};

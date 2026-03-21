@@ -1,5 +1,7 @@
 # Session Restore Edge Cases — Research from Zellij, Waveterm, Canopy
 
+> Based on analysis of reference projects. All code is pseudocode/sketches — see [docs/refs/README.md](../../refs/README.md) for rules.
+
 Research for Yord's progressive 4-phase restore system (design.md section 6.2).
 
 ---

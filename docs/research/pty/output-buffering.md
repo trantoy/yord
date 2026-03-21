@@ -1,5 +1,7 @@
 # PTY Output Buffering Research
 
+> Based on analysis of reference projects. All code is pseudocode/sketches — see [docs/refs/README.md](../../refs/README.md) for rules.
+
 Research into how wezterm and waveterm handle PTY output buffering,
 coalescing, and delivery to the terminal renderer.
 
@@ -16,24 +18,13 @@ Source: `refs/wezterm/mux/src/lib.rs`
 
 ### Data Flow: PTY fd -> buffer -> consumer
 
-Two dedicated threads per pane, connected by an OS socketpair:
-
-```
-Thread 1 (read_from_pane_pty)     Thread 2 (parse_buffered_data)
-----------------------------------  ----------------------------------
-blocking read(pty_fd, 1MB buf)      blocking read(socketpair_rx, 128KB buf)
-  |                                   |
-  +-> write_all(socketpair_tx)        +-> parser.parse() -> Vec<Action>
-                                      +-> coalesce check (poll + deadline)
-                                      +-> send_actions_to_mux(actions)
-                                            |
-                                            +-> pane.perform_actions()
-                                            +-> MuxNotification::PaneOutput
-```
-
-Thread 1 does only blocking reads from the PTY fd and writes raw bytes into a
-socketpair. Thread 2 reads from the other end of the socketpair, parses escape
-sequences into `Action` values, then batches them.
+Two dedicated threads per pane, connected by an OS socketpair.
+**Thread 1** does only blocking reads from the PTY fd (into a 1 MB buffer) and
+writes raw bytes into one end of the socketpair. **Thread 2** reads from the
+other end of the socketpair (into a 128 KB buffer), parses escape sequences
+into structured action values, applies coalescing (poll with a deadline), and
+then dispatches the batched actions to the mux, which performs them on the pane
+and emits a pane-output notification.
 
 ### Coalescing Strategy
 
@@ -94,28 +85,15 @@ Sources:
 
 ### Data Flow: PTY fd -> buffer -> consumer
 
-Single goroutine per shell, no coalescing:
+Single goroutine per shell, no coalescing. The goroutine reads from the PTY
+in 4 KB chunks, then for each chunk it does two things: (1) appends the data
+to an in-memory circular cache (computing a part index from the offset modulo
+the max part count and copying data into the corresponding cache entry, while
+monotonically updating the file size), and (2) publishes a block-file event
+through a broker, with the raw terminal data base64-encoded inline in the
+event payload.
 
-```
-Goroutine (pty-read loop)
---------------------------
-shellProc.Cmd.Read(4KB buf)
-  |
-  +-> HandleAppendBlockFile(blockId, "term", data)
-        |
-        +-> filestore.WFS.AppendData()   // write to in-memory cache
-        |     CacheEntry.writeAt():
-        |       - compute partIdx = (offset / 64KB) % maxPart
-        |       - copy data into DataCacheEntry.Data
-        |       - update File.Size (monotonic)
-        |
-        +-> wps.Broker.Publish(WaveEvent{
-              Event: Event_BlockFile,
-              Data: { Data64: base64(data) }  // raw data inline in the event!
-            })
-```
-
-The frontend (xterm.js) subscribes to `Event_BlockFile` events and receives
+The frontend (xterm.js) subscribes to these block-file events and receives
 the terminal data via the event bus as base64-encoded payloads. There is no
 separate "pull" mechanism for streaming data -- it is pushed every single read.
 
@@ -204,9 +182,10 @@ side (xterm.js handles that).
   `Action` values. Yord sends raw bytes to xterm.js, so there is nothing to
   parse, and the socketpair is unnecessary overhead.
 
-### Concrete Design
+### Concrete Design (Proposed for Yord)
 
 ```rust
+// PROPOSED SKETCH — original design for Yord, not from any reference project.
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::ipc::Channel;

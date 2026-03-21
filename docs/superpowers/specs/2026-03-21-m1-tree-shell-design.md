@@ -393,9 +393,12 @@ Linux, Windows, macOS, Android, iOS. Browser deferred.
 
 ## 13. Research References
 
-- `docs/research/ide-pain-points.md` — VS Code, Neovim, tmux/zellij pain points
-- `docs/research/ide-path.md` — IDE architecture lessons (Xi, Atom, VS Code, Zed, Lapce)
-- `docs/research/tauri-pitfalls.md` — Tauri 2 bugs, security, performance traps
+- `docs/research/landscape/ide-pain-points.md` — VS Code, Neovim, tmux/zellij pain points
+- `docs/research/landscape/ide-path.md` — IDE architecture lessons (Xi, Atom, VS Code, Zed, Lapce)
+- `docs/research/landscape/tauri-pitfalls.md` — Tauri 2 bugs, security, performance traps
+- `docs/research/pty/` — actor patterns, output buffering, escape filtering
+- `docs/research/storage/` — SQLite single-writer, session restore edge cases
+- `docs/research/frontend/` — flat-to-tree (buildTree) implementation
 - `docs/refs/report.md` — 9 reference project survey
 - `docs/refs/projects/` — per-project deep research
 

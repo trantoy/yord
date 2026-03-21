@@ -1,5 +1,7 @@
 # Flat Storage to Tree View — Zellij, Helix, and Yord's buildTree()
 
+> Based on analysis of reference projects. All code is pseudocode/sketches — see [docs/refs/README.md](../../refs/README.md) for rules.
+
 Research on how existing Rust projects convert flat/semi-flat data into tree views,
 and a concrete recommendation for Yord's `buildTree()` implementation.
 
@@ -18,13 +20,7 @@ and a concrete recommendation for Yord's `buildTree()` implementation.
 `TiledPanes` owns a `BTreeMap<PaneId, Box<dyn Pane>>`. This is the canonical flat
 store — panes are keyed by ID with no embedded parent/child links. Each pane carries
 its own `PaneGeom` (position, size, stacking info) but no pointer to a parent.
-
-```rust
-pub struct TiledPanes {
-    pub panes: BTreeMap<PaneId, Box<dyn Pane>>,
-    // ... display_area, viewport, active_panes, etc.
-}
-```
+The struct also holds fields for display area, viewport, and active pane tracking.
 
 ### How the tree view is derived
 
@@ -32,17 +28,10 @@ Zellij uses two tree representations, for different purposes:
 
 **A) `TiledPaneLayout` — persistent tree (config/restore)**
 
-This is a conventional recursive tree used for layout definitions and session restore:
-
-```rust
-pub struct TiledPaneLayout {
-    pub children_split_direction: SplitDirection,
-    pub children: Vec<TiledPaneLayout>,
-    pub split_size: Option<SplitSize>,
-    pub run: Option<Run>,
-    // ...
-}
-```
+This is a conventional recursive tree used for layout definitions and session restore.
+Each node stores a split direction (horizontal/vertical), a vector of child layouts,
+an optional split size, and an optional run command. Additional fields handle
+per-pane config like focus and title.
 
 Its key method `position_panes_in_space()` takes a tree layout and flattens it into
 `Vec<(TiledPaneLayout, PaneGeom)>` — a list of positioned panes. This is the
@@ -52,15 +41,9 @@ materialized into geometry for each leaf pane.
 **B) `TiledPaneGrid` — transient view (runtime operations)**
 
 For runtime operations (resize, split, neighbor-finding), Zellij creates a
-*transient* `TiledPaneGrid` from the flat pane map on each operation:
-
-```rust
-pub struct TiledPaneGrid<'a> {
-    panes: Rc<RefCell<HashMap<PaneId, &'a mut Box<dyn Pane>>>>,
-    display_area: Size,
-    viewport: Viewport,
-}
-```
+*transient* `TiledPaneGrid` from the flat pane map on each operation.
+`TiledPaneGrid` holds a ref-counted, ref-cell-wrapped `HashMap` of borrowed pane
+references plus the display area and viewport dimensions.
 
 This grid is constructed ad-hoc from `&mut self.panes` every time it's needed
 (e.g. `relayout()`, `has_room_for_new_pane()`, `resize()`). It borrows the pane
@@ -116,31 +99,15 @@ Helix uses a `SlotMap<ViewId, Node>` — a generational arena. This is conceptua
 flat (all nodes in one contiguous allocator), but each node stores an explicit
 `parent: ViewId` link, and container nodes store `children: Vec<ViewId>`.
 
-```rust
-pub struct Tree {
-    root: ViewId,
-    pub focus: ViewId,
-    area: Rect,
-    nodes: SlotMap<ViewId, Node>,
-    stack: Vec<(ViewId, Rect)>,  // reused for traversals
-}
+The main `Tree` struct holds:
+- `root` and `focus` view IDs
+- a `Rect` for the total area
+- a `SlotMap<ViewId, Node>` as the flat arena
+- a reusable `Vec<(ViewId, Rect)>` stack for traversals (avoids allocation churn)
 
-pub struct Node {
-    parent: ViewId,
-    content: Content,
-}
-
-pub enum Content {
-    View(Box<View>),
-    Container(Box<Container>),
-}
-
-pub struct Container {
-    layout: Layout,           // Horizontal | Vertical
-    children: Vec<ViewId>,
-    area: Rect,
-}
-```
+Each `Node` has a `parent: ViewId` and a `Content` enum that is either a `View`
+(leaf, holding the editor view) or a `Container` (holding a layout direction, a
+`children: Vec<ViewId>`, and a `Rect` for its area).
 
 ### How the tree view is derived/built
 
@@ -149,28 +116,17 @@ Nodes live in a flat arena (SlotMap) but carry parent/children links that encode
 the tree topology. The tree is always maintained, not rebuilt.
 
 The critical method is `recalculate()`, which computes screen geometry from
-the tree structure:
+the tree structure. It works as follows:
 
-```rust
-pub fn recalculate(&mut self) {
-    self.stack.push((self.root, self.area));
-    while let Some((key, area)) = self.stack.pop() {
-        match &mut self.nodes[key].content {
-            Content::View(view) => { view.area = area; }
-            Content::Container(container) => {
-                container.area = area;
-                // divide area among children based on layout direction
-                for (i, child) in container.children.iter().enumerate() {
-                    // calculate child_area...
-                    self.stack.push((*child, child_area));
-                }
-            }
-        }
-    }
-}
-```
+1. Push `(root, total_area)` onto the reusable stack.
+2. Pop entries from the stack. For each entry:
+   - If the node is a **View** (leaf): assign the area directly.
+   - If the node is a **Container**: assign the area, then divide it among
+     children based on the container's layout direction (horizontal or vertical),
+     pushing each `(child_id, child_area)` onto the stack.
+3. Continue until the stack is empty.
 
-This is an iterative BFS/DFS using a reusable stack (no allocations after warmup).
+This is an iterative DFS using a reusable stack (no allocations after warmup).
 
 ### Performance characteristics
 
@@ -189,11 +145,8 @@ This is an iterative BFS/DFS using a reusable stack (no allocations after warmup
 
 Order is determined by index within `Container.children: Vec<ViewId>`. Position in
 the vec = position on screen. Insert always goes after the currently focused node:
-
-```rust
-let pos = container.children.iter().position(|&child| child == focus).unwrap();
-container.children.insert(pos + 1, node);
-```
+the code finds the index of the focused child in the vec, then inserts the new node
+at `position + 1`.
 
 There is no separate `Order` component — the vec index IS the order.
 
@@ -269,7 +222,7 @@ Incremental tree updates add complexity for zero perceptible benefit at this sca
 The Svelte integration via `$state.raw()` requires full reassignment to trigger
 reactivity anyway, so there is no partial-update shortcut available on the UI side.
 
-### Implementation
+### Implementation (proposed sketch for Yord)
 
 ```typescript
 // src/lib/types/tree.ts
@@ -372,7 +325,7 @@ export function buildTree(entities: EntityWithComponents[]): TreeNode[] {
 }
 ```
 
-### Integration with Svelte 5 $state.raw()
+### Integration with Svelte 5 $state.raw() (proposed sketch for Yord)
 
 ```typescript
 // In a .svelte.ts store file

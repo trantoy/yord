@@ -1,5 +1,7 @@
 # PTY Actor Patterns — Research: Canopy, Zellij, Waveterm
 
+> Based on analysis of reference projects. All code is pseudocode/sketches — see [docs/refs/README.md](../../refs/README.md) for rules.
+
 Research for Yord's PTY management layer. Each project solves the same
 fundamental problem: managing N concurrent PTY sessions from a single process.
 
@@ -312,9 +314,10 @@ dispatch maps to an enum + match, which is more idiomatic in Rust.
               └──────────────┘
 ```
 
-### Concrete Rust Sketch
+### Concrete Rust Sketch (Proposed for Yord)
 
 ```rust
+// PROPOSED SKETCH — original design for Yord, not from any reference project.
 use std::collections::HashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot, RwLock};

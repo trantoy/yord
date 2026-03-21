@@ -1,5 +1,7 @@
 # Escape Sequence Filtering Specification
 
+> Based on analysis of reference projects. All code is pseudocode/sketches — see [docs/refs/README.md](../../refs/README.md) for rules.
+
 Research based on waveterm, zed, and wezterm codebases. Targeting CVE-2022-45872-class attacks (RCE via terminal escape sequences in iTerm2) and related clipboard/title exfiltration vectors.
 
 ---
@@ -263,7 +265,7 @@ Location: Between PTY read and Tauri event emission. This is the chokepoint wher
 Use a lightweight state machine or the `vte` crate (the same VTE parser that alacritty uses) to parse the byte stream. The filter operates as a transform: it reads PTY output, parses escape sequences, and emits only allowed sequences to the output buffer.
 
 ```rust
-// Pseudocode
+// PROPOSED SKETCH — pseudocode for Yord's escape filter, not from any reference project.
 struct EscapeFilter {
     parser: vte::Parser,
     performer: FilterPerformer,
@@ -355,9 +357,10 @@ These are NOT security filters. They are application-level handlers that process
 
 ## 4. xterm.js Configuration
 
-### Terminal Options
+### Terminal Options (Proposed for Yord)
 
 ```typescript
+// PROPOSED SKETCH — Yord's xterm.js configuration.
 const terminal = new Terminal({
     // Core rendering
     allowTransparency: true,
@@ -381,9 +384,11 @@ const terminal = new Terminal({
 });
 ```
 
-### Parser Handler Registrations
+### Parser Handler Registrations (Proposed for Yord)
 
 ```typescript
+// PROPOSED SKETCH — Yord's xterm.js parser handler registrations.
+
 // --- OSC 7: Current Working Directory ---
 terminal.parser.registerOscHandler(7, (data: string) => {
     // Validate: file: protocol only, max 1024 chars
@@ -436,22 +441,29 @@ terminal.parser.registerCsiHandler({ prefix: "?", final: "l" }, (params) => {
 });
 ```
 
-### Paste Handling
+### Paste Handling (Proposed for Yord)
 
 ```typescript
-// Intercept paste events to de-fang bracketed paste injection
+// PROPOSED SKETCH — Yord's paste sanitization.
+//
+// Intercept paste events and strip any embedded bracketed-paste
+// start/end markers (\x1b[200~ and \x1b[201~) from the clipboard
+// content before forwarding to the PTY. This prevents an attacker
+// from breaking out of a bracketed paste context to inject raw
+// commands. xterm.js will re-add its own bracketed paste markers
+// if the mode is active.
 function handlePaste(event: ClipboardEvent): void {
     event.preventDefault();
     const text = event.clipboardData?.getData("text/plain") ?? "";
-
-    // Strip embedded bracketed paste markers (wezterm approach)
-    const sanitized = text
-        .replace(/\x1b\[200~/g, "")
-        .replace(/\x1b\[201~/g, "");
-
-    // Send to PTY via Tauri command
-    // xterm.js will add its own bracketed paste markers if the mode is active
+    const sanitized = stripBracketedPasteMarkers(text);
     sendToPty(sanitized);
+}
+
+function stripBracketedPasteMarkers(input: string): string {
+    // Remove the two CSI sequences that delimit bracketed paste
+    return input
+        .replaceAll("\x1b[200~", "")
+        .replaceAll("\x1b[201~", "");
 }
 ```
 
