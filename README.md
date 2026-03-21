@@ -24,16 +24,22 @@ Hybrid ECS + Tree. Data stored flat (entities + components), rendered as a tree 
 
 | Layer | Technology |
 |-------|-----------|
-| UI | Svelte 5 |
+| UI | Svelte 5 + TypeScript |
 | Desktop shell | Tauri 2 |
 | Backend | Rust |
 | Terminal | xterm.js |
 | PTY | portable-pty |
-| Storage | SQLite |
+| Storage | SQLite (rusqlite, single-writer + WAL) |
+| IPC | `#[tauri::command]` + `Channel<T>` |
 
 ## Status
 
-Pre-implementation. See [docs/design.md](docs/design.md) for the full design document.
+Pre-implementation. M1 target: tree + shell.
+
+- [Design doc](docs/design.md)
+- [Architecture](docs/architecture.md)
+- [M1 spec](docs/superpowers/specs/2026-03-21-m1-tree-shell-design.md)
+- [M1 plan](docs/superpowers/plans/2026-03-21-m1-tree-shell.md)
 
 ## License
 
