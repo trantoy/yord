@@ -544,7 +544,7 @@ impl Database {
 
     pub async fn read<F, T>(&self, f: F) -> T
     where
-        F: FnOnce(&mut Connection) -> T + Send + 'static,
+        F: FnOnce(&Connection) -> T + Send + 'static,
         T: Send + 'static,
     {
         let db = self.clone();
@@ -730,7 +730,7 @@ use crate::ecs::component::*;
 use crate::ecs::entity::*;
 use crate::ecs::traits::EntityStore;
 use crate::error::YordError;
-use rusqlite::params;
+use rusqlite::{params, Connection};
 use std::collections::HashMap;
 use tracing::debug;
 
@@ -1458,7 +1458,7 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 // Use $state.raw() — no deep proxy (5,000x perf cliff with $state())
 let entities: EntityWithComponents[] = $state.raw([]);
 let tree: TreeNode[] = $state.raw([]);
-let selectedId = $state<string | null>(null);
+let selectedId: string | null = $state(null);
 
 let unlisteners: UnlistenFn[] = [];
 let rebuildQueued = false;
