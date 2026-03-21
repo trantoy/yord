@@ -35,7 +35,7 @@ A desktop app where you create projects, add terminal nodes, and manage everythi
 | Terminal | xterm.js (canvas default, WebGL fallback up) | Industry standard |
 | PTY | portable-pty 0.9+ | Cross-platform, from wezterm |
 | Storage | rusqlite | Single-writer + WAL, in-memory cache |
-| IPC typed | taurpc + specta | Auto-gen TS types from Rust traits |
+| IPC commands | `#[tauri::command]` + manual types | taurpc doesn't support Channel\<T\>; evaluate at M2 |
 | IPC streaming | Tauri 2 Channel\<T\> | Per-PTY high-throughput data |
 | Package manager | Bun | Fast installs |
 | CSS | Plain CSS + CSS variables | Scoped Svelte styles |
@@ -77,7 +77,15 @@ CREATE INDEX idx_belongs_to ON components(component_type, json_extract(data, '$.
   WHERE component_type = 'BelongsTo';
 ```
 
-Single-writer connection + reader pool. Verify bundled SQLite >= 3.51.3 (WAL-reset data race fix).
+**Single-writer architecture** (see `docs/research/storage/sqlite-single-writer.md` for full implementation):
+- Dedicated `std::thread` for writes (not `spawn_blocking` — Tokio would parallelize, defeating single-writer)
+- `ThreadLocal<Connection>` for readers (one per OS thread, no checkout/return overhead, Zed pattern)
+- Write closures sent via `mpsc::unbounded_channel`, results returned via `oneshot`
+- `SQLITE_OPEN_NO_MUTEX` on all connections (we guarantee single-thread access)
+- Reader connections opened with `SQLITE_OPEN_READ_ONLY` (defense in depth)
+- Simple append-only migration system with `_migrations` version table
+- Verify bundled SQLite >= 3.51.3 (WAL-reset data race fix)
+- Run `PRAGMA wal_checkpoint(TRUNCATE)` on writer during shutdown
 
 ### 3.2 M1 Components
 
@@ -161,26 +169,47 @@ M1 implementations: `SqliteEntityStore`, `PortablePtyBackend`, `UnixProcessManag
 
 ### 5.3 PTY Output Streaming
 
-- Rust ring buffer (256KB per PTY)
-- Flush every 4-8ms or at 4KB threshold (16ms feels sluggish for interactive use; zed uses 4ms)
-- One Tauri 2 `Channel<PtyOutput>` per entity
+Single async Tokio task per PTY with ring buffer + timer flush. See `docs/research/pty/output-buffering.md` for full design.
+
+- 256KB ring buffer per PTY (bounded memory, overwrites oldest on overflow — xterm.js has its own scrollback)
+- `tokio::select!` with `biased` over: PTY read (priority), 4ms timer tick, command channel
+- Flush when timer fires OR buffer >75% full (adaptive: don't wait under load)
+- 32KB read buffer (drains kernel PTY buffer in 1-2 reads)
+- One Tauri 2 `Channel<Vec<u8>>` per entity
 - Raw `Vec<u8>` / `Uint8Array` (not string conversion — handles non-UTF-8)
-- Check `channel.send()` result — if channel is broken (e.g., frontend reload), stop reading and clean up PTY state. Don't loop forever into a dead channel.
+- Check `channel.send()` result — if broken (e.g., frontend reload), stop reading and clean up. Don't loop into a dead channel.
+- No socketpair (simpler than wezterm — we don't parse escape sequences on Rust side)
 
-### 5.4 PTY Process Management (Actor Pattern)
+### 5.4 PTY Process Management (Per-PTY Actor Pattern)
 
+One `tokio::spawn` task per PTY (not one global actor). See `docs/research/pty/actor-patterns.md` for full design.
+
+**Registry:**
 ```rust
-enum PtyCommand {
-    Spawn { id: EntityId, cmd: Vec<String>, cwd: String, reply: oneshot::Sender<Result<()>> },
-    Write { id: EntityId, data: Vec<u8> },
-    Resize { id: EntityId, cols: u16, rows: u16 },
-    Kill { id: EntityId },
+struct PtyRegistry {
+    ptys: RwLock<HashMap<EntityId, PtyHandle>>,
+}
+
+struct PtyHandle {
+    cmd_tx: mpsc::Sender<PtyCommand>,
 }
 ```
 
-Single actor task owns all PTY state. No `Arc<Mutex<HashMap>>`.
+**Per-PTY actor commands:**
+```rust
+enum PtyCommand {
+    Write(Vec<u8>),
+    Resize { rows: u16, cols: u16 },
+    Kill,
+    GetStatus(oneshot::Sender<PtyStatus>),
+}
+```
 
-**Write blocking concern**: `writer.write_all()` can block if PTY buffer is full. If the actor blocks on a write, it can't process other commands (resize, kill). Writes should use a separate channel or timeout to prevent actor freeze.
+Each actor task owns its PTY state and runs a `tokio::select!` loop over: PTY read, pending writes, and command channel. Actor self-removes from registry on exit (EOF, error, or kill).
+
+**Backpressure:** 10MB pending-bytes cap per PTY (zellij pattern). If exceeded, pending writes are dropped with a warning — prevents OOM. Write blocking concern addressed: writes go through the actor's pending buffer and are drained via `select!`, never blocking command processing.
+
+**Why per-PTY actors (not one global)?** A stuck PTY blocks only its own actor task. Tokio can run thousands of tasks on a few threads. Global mutex (canopy pattern) would freeze all terminals on one stuck PTY.
 
 ### 5.5 Kill Propagation
 
@@ -212,13 +241,26 @@ Non-shell processes (Docker, agents): `SIGTERM` with 5s timeout.
 
 ### 5.7 Session Restore (Progressive)
 
-**Phase 1 (0–200ms):** Load entities from SQLite. Show tree with skeleton UI. Use `tauri-plugin-window-state` for window geometry restore.
+See `docs/research/storage/session-restore.md` for exhaustive edge case table.
 
-**Phase 2 (200ms–1s):** Stale PID cleanup. Spawn focused terminal only.
+**Phase 1 (0–200ms):** Load entities from SQLite. Run `PRAGMA integrity_check` (if corrupt, copy to `.bak`, start fresh). Show tree with skeleton UI. Use `tauri-plugin-window-state` for window geometry restore.
 
-**Phase 3 (1–5s):** Validate `Pty.cwd` exists and `Pty.cmd` on PATH. Spawn remaining `RestoreOnStart` entities. Show errors for invalid ones.
+**Phase 2 (200ms–1s):** Stale PID cleanup:
+- Store `(pid, started_at)` pairs — `kill(pid, 0)` only tells you a process exists, not that it's YOURS. Compare `started_at` against `/proc/<pid>/stat` start time on Linux. If mismatch, treat as dead.
+- Also kill stale process groups (`killpg`) to clean up child processes.
+- Write `last_clean_shutdown` timestamp to DB on clean exit. On startup, if missing/stale, run aggressive cleanup.
+- Spawn focused terminal only.
 
-**Phase 4 (5s+):** `PRAGMA optimize`.
+**Phase 3 (1–5s):** Validate and spawn remaining `RestoreOnStart` entities:
+- Validate `Pty.cwd` exists (fallback: parent project CWD → `$HOME`). Show warning badge if fallback used.
+- Validate `Pty.cmd` on PATH. If missing, show as `Crashed` with "Command not found" — don't spawn.
+- **Default shell detection:** If `Pty.cmd` matches previously-detected default shell, use CURRENT `$SHELL` instead (don't hardcode paths).
+- **Bounded concurrency:** Semaphore (4 concurrent spawns) to prevent thundering herd. Priority: focused → visible → background.
+- **Per-entity mutex** to prevent double-spawn race (user clicks "start" during Phase 3).
+- **Crash loop prevention:** If process exits within <2s of spawn during restore, don't auto-restart. Show as `Crashed`.
+- Filter session-specific env vars on restore: `TERM_SESSION_ID`, `TMUX`, `STY`, `WINDOWID`, `SHELL_SESSION_ID`.
+
+**Phase 4 (5s+):** `PRAGMA optimize`. Show restore summary toast: "5 terminals restored, 1 failed (missing directory)".
 
 On terminal restore: prepend `\033c` reset to clear stale terminal state.
 
@@ -230,25 +272,33 @@ On terminal restore: prepend `\033c` reset to clear stale terminal state.
 
 ## 6. IPC
 
-### 6.1 Commands (taurpc)
+### 6.1 Commands (`#[tauri::command]`)
+
+Plain Tauri commands with manual TypeScript types. `taurpc` doesn't support `Channel<T>` (Yord's most critical IPC mechanism). Evaluate taurpc at M2 when IPC surface grows.
 
 ```rust
-#[taurpc::procedures]
-trait YordApi {
-    fn create_entity(components: Vec<ComponentData>) -> Result<EntityId>;
-    fn delete_entity(id: String) -> Result<()>;
-    fn get_entities() -> Result<Vec<EntityWithComponents>>;
-    fn set_component(entity_id: String, component: ComponentData) -> Result<()>;
-    fn remove_component(entity_id: String, component_type: String) -> Result<()>;
-    fn start_entity(id: String) -> Result<()>;
-    fn stop_entity(id: String) -> Result<()>;
-    fn restart_entity(id: String) -> Result<()>;
-    fn kill_project(id: String) -> Result<()>;
-    fn pty_write(entity_id: String, data: Vec<u8>) -> Result<()>;
-    fn pty_resize(entity_id: String, cols: u16, rows: u16) -> Result<()>;
-    // allocate_port / release_port deferred to M3 (web nodes)
-}
+// Entity management
+#[tauri::command] async fn create_entity(components: Vec<ComponentData>) -> Result<EntityId, YordError>;
+#[tauri::command] async fn delete_entity(id: String) -> Result<(), YordError>;
+#[tauri::command] async fn get_entities() -> Result<Vec<EntityWithComponents>, YordError>;
+
+// Component management
+#[tauri::command] async fn set_component(entity_id: String, component: ComponentData) -> Result<(), YordError>;
+#[tauri::command] async fn remove_component(entity_id: String, component_type: String) -> Result<(), YordError>;
+
+// Lifecycle
+#[tauri::command] async fn start_entity(id: String, channel: Channel<Vec<u8>>) -> Result<(), YordError>;
+#[tauri::command] async fn stop_entity(id: String) -> Result<(), YordError>;
+#[tauri::command] async fn restart_entity(id: String, channel: Channel<Vec<u8>>) -> Result<(), YordError>;
+#[tauri::command] async fn kill_project(id: String) -> Result<(), YordError>;
+
+// PTY
+#[tauri::command] async fn pty_write(entity_id: String, data: Vec<u8>) -> Result<(), YordError>;
+#[tauri::command] async fn pty_resize(entity_id: String, cols: u16, rows: u16) -> Result<(), YordError>;
+// allocate_port / release_port deferred to M3
 ```
+
+Note: `start_entity` and `restart_entity` accept a `Channel<Vec<u8>>` parameter for PTY output streaming. The frontend creates the channel and passes it in the invoke call.
 
 ### 6.2 Events and Channels
 
@@ -269,8 +319,13 @@ Cleanup: every `listen()` and Channel `onmessage` cleaned up on component destro
 
 ### 7.1 Tree Panel
 
-- `buildTree()` reactively derives tree from flat entity data
-- Use `$state.raw()` for entity data (NOT `$state()` — 5,000x perf cliff with deep proxies)
+See `docs/research/frontend/flat-to-tree.md` for full `buildTree()` implementation.
+
+- `buildTree()`: O(n) single-pass algorithm. Index entities by `parent_id`, sort by `Order.index`, recursive assembly. Returns fresh `TreeNode[]` for `$state.raw()` reassignment.
+- Handles orphans (promote to root — visible, not silently dropped), cycles (visited set), missing parents
+- Use `$state.raw()` for entity/tree data (NOT `$state()` — 5,000x perf cliff with deep proxies)
+- Called on: initial load, `entity:component-changed` event, `entity:removed` event
+- Debounce rapid events with `queueMicrotask()` to avoid redundant rebuilds
 - Collapsible, color-coded status dots (green=Running, red=Crashed, grey=idle)
 - Right-click context menu: start / stop / restart / rename / delete / add child
 - Drag to reorder (updates `Order` component)
@@ -284,7 +339,9 @@ Cleanup: every `listen()` and Channel `onmessage` cleaned up on component destro
 - `@xterm/addon-fit`, `@xterm/addon-search` (`Cmd+F`)
 - Default scrollback: 5,000 lines
 - Ship bundled monospace font (system monospace fallback)
-- Escape sequence sanitization: whitelist allowed, strip OSC 52, DECRQSS, title set/report
+- **Escape sequence filtering (two-layer defense)** — see `docs/research/pty/escape-filtering.md`:
+  - **Layer 1 (Rust, `vte` crate):** Strip CSI 20t/21t (title reports, RCE vector), all window manipulation CSI t, DCS sequences, DECRQSS. Validate OSC 7 (file: protocol only, 1024 byte cap). Block OSC 52 clipboard queries. Enforce OSC 52 size limits (75KB decoded, 128KB raw).
+  - **Layer 2 (xterm.js handlers):** OSC 52 focus gating (only write clipboard when terminal focused) + user notification. OSC 7 CWD tracking. Paste de-fanging (strip bracketed paste markers `\x1b[200~`/`\x1b[201~` from clipboard content).
 
 ### 7.3 Focus & Keyboard
 
@@ -323,7 +380,7 @@ enum YordError {
 }
 ```
 
-Errors serialized to frontend as structured JSON via taurpc. Frontend displays errors in the tree node (Crashed state with stderr tail) or as toast notifications.
+Errors serialized to frontend as JSON string via Tauri's `Result` return type. Frontend displays errors in the tree node (Crashed state with stderr tail) or as toast notifications.
 
 ---
 
@@ -343,7 +400,7 @@ Errors serialized to frontend as structured JSON via taurpc. Frontend displays e
 yord/
 ├── src-tauri/src/
 │   ├── main.rs
-│   ├── commands/          (taurpc trait + handlers)
+│   ├── commands/          (#[tauri::command] handlers)
 │   ├── ecs/
 │   │   ├── entity.rs      (Entity struct)
 │   │   ├── component.rs   (Component types + ComponentData enum)
@@ -358,12 +415,15 @@ yord/
 │   │   ├── mod.rs
 │   │   └── migrations/
 │   └── process/
-│       ├── pty.rs         (PortablePtyBackend, reader thread)
+│       ├── pty.rs         (PortablePtyBackend, PTY spawning)
+│       ├── actor.rs       (PtyRegistry, PtyHandle, per-PTY actor loop)
+│       ├── ring_buffer.rs (256KB ring buffer for output batching)
+│       ├── escape_filter.rs (vte-based escape sequence filter)
 │       └── port_pool.rs
 ├── src/
 │   ├── lib/stores/        (entities, tree, focus)
-│   ├── lib/types/         (entity, tree — auto-gen from Rust)
-│   ├── lib/ipc/           (taurpc client wrappers)
+│   ├── lib/types/         (entity, tree, component types)
+│   ├── lib/ipc/           (typed invoke wrappers)
 │   ├── components/tree/   (TreePanel, TreeNode, ContextMenu)
 │   ├── components/views/  (TerminalView)
 │   └── App.svelte
@@ -404,5 +464,5 @@ Linux, Windows, macOS, Android, iOS. Browser deferred.
 
 ---
 
-*Spec version 1.0 — 2026-03-21*
-*Approved after brainstorming session with 3 review rounds on design docs*
+*Spec version 2.0 — 2026-03-21*
+*Updated with findings from 7 research dives (actor patterns, output buffering, escape filtering, flat-to-tree, session restore, SQLite single-writer, taurpc compatibility)*
