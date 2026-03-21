@@ -40,3 +40,6 @@ npm-debug.log*
 *.db
 *.db-journal
 *.db-wal
+
+# Reference repos (cloned for research)
+/refs/
