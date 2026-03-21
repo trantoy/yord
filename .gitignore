@@ -43,3 +43,6 @@ npm-debug.log*
 
 # Reference repos (cloned for research)
 /refs/
+
+# Downloaded issue data (large JSON files)
+docs/refs/issues/

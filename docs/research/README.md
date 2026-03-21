@@ -9,3 +9,4 @@
 - [storage/](storage/) — SQLite single-writer, session restore edge cases
 - [frontend/](frontend/) — flat-to-tree conversion (buildTree)
 - [landscape/](landscape/) — broader ecosystem research (IDE pain points, Tauri pitfalls)
+- [from-issues/](from-issues/) — findings mined from 32k ref project issues (pitfalls, cross-platform, spec validation, label analysis)
