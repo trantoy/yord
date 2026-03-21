@@ -140,7 +140,7 @@ M1 implementations: `SqliteEntityStore`, `PortablePtyBackend`, `UnixProcessManag
 - **LifecycleSystem** — spawn/kill/restart PTY processes
 - **RestoreSystem** — progressive 4-phase restore on startup
 - **KillProjectSystem** — depth-first by component type, process group kill
-- **PersistSystem** — debounced write to SQLite with WAL mode
+- **PersistSystem** — debounced write to SQLite with WAL mode (1s debounce for component changes, `PRAGMA optimize` on shutdown)
 
 ### 5.2 PTY Spawning
 
@@ -151,7 +151,9 @@ M1 implementations: `SqliteEntityStore`, `PortablePtyBackend`, `UnixProcessManag
 - `close_fds` crate for fd hygiene after fork
 - `take_writer()` even if unused (prevents child blocking on stdin forever)
 - `std::thread::spawn` per PTY reader (not Tokio — avoids thread pool starvation)
+- Wrap reader thread body in `std::panic::catch_unwind` — on panic, still clean up PTY state and send exit notification
 - Kill flag (`Arc<AtomicBool>`) + `ChildKiller` handle for clean shutdown
+- Implement `Drop` on PTY handle with 100ms graceful kill timeout as defense-in-depth
 - Respect `$SHELL`, launch as interactive shell by default
 - Remove `npm_config_prefix` env, filter `CLAUDECODE*` env vars
 - macOS PATH augmentation (`~/.cargo/bin`, Homebrew paths, nvm/fnm)
@@ -160,9 +162,10 @@ M1 implementations: `SqliteEntityStore`, `PortablePtyBackend`, `UnixProcessManag
 ### 5.3 PTY Output Streaming
 
 - Rust ring buffer (256KB per PTY)
-- Flush every 16ms (60fps) or at 4KB threshold
+- Flush every 4-8ms or at 4KB threshold (16ms feels sluggish for interactive use; zed uses 4ms)
 - One Tauri 2 `Channel<PtyOutput>` per entity
 - Raw `Vec<u8>` / `Uint8Array` (not string conversion — handles non-UTF-8)
+- Check `channel.send()` result — if channel is broken (e.g., frontend reload), stop reading and clean up PTY state. Don't loop forever into a dead channel.
 
 ### 5.4 PTY Process Management (Actor Pattern)
 
@@ -177,6 +180,8 @@ enum PtyCommand {
 
 Single actor task owns all PTY state. No `Arc<Mutex<HashMap>>`.
 
+**Write blocking concern**: `writer.write_all()` can block if PTY buffer is full. If the actor blocks on a write, it can't process other commands (resize, kill). Writes should use a separate channel or timeout to prevent actor freeze.
+
 ### 5.5 Kill Propagation
 
 Depth-first by component type:
@@ -190,18 +195,19 @@ M1 implements kill for `Pty` only. Other component types listed for forward comp
 
 Entities with `Pinned` component are skipped.
 
-Per-entity kill sequence (PTY):
-1. `SIGHUP` to process group (traditional terminal-close signal)
+Per-entity kill sequence (PTY — two-step, from zed):
+1. `killpg(tcgetpgrp(pty_fd), SIGHUP)` — kill foreground process group first (e.g., `cargo build`)
 2. Poll `try_wait()` at 50ms intervals for 250ms grace
-3. `SIGKILL` to process group if still alive
-4. Remove `Running` component after confirmed exit
+3. Kill shell process group if foreground kill succeeded
+4. `SIGKILL` to process group if still alive
+5. Remove `Running` component after confirmed exit
 
 Non-shell processes (Docker, agents): `SIGTERM` with 5s timeout.
 
 ### 5.6 App Shutdown
 
 - Custom quit handler + `RunEvent::ExitRequested` (Tauri's default Quit skips destructors)
-- `on_window_event(Destroyed)` to kill PTY children
+- `on_window_event(Destroyed)` to kill PTY children — use `try_state()` (returns Option), not `state()` (panics if unavailable during abnormal shutdown)
 - On startup: sweep SQLite for stale `Running` PIDs from previous crashes
 
 ### 5.7 Session Restore (Progressive)
@@ -215,6 +221,10 @@ Non-shell processes (Docker, agents): `SIGTERM` with 5s timeout.
 **Phase 4 (5s+):** `PRAGMA optimize`.
 
 On terminal restore: prepend `\033c` reset to clear stale terminal state.
+
+### 5.8 Foreground Process Tracking (M1 stretch goal)
+
+`tcgetpgrp(pty_fd)` returns the foreground process PID. Combined with `sysinfo` crate, show dynamic labels in the tree: "zsh" → "npm run dev" → "node server.js". Cache with 300ms TTL (wezterm pattern). Low-hanging fruit for better UX — skip if time-constrained.
 
 ---
 
