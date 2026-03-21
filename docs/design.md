@@ -208,11 +208,13 @@ Runtime state (pid, port) lives in `Running` components, not a separate sessions
 
 Entities with the `Pinned` component are skipped.
 
-**Process group kill**: Signals are sent to the entire process group (`kill(-pgid, SIGTERM)`), not just the shell PID. This ensures child processes (e.g., `node server.js` spawned by `npm run dev`) are killed too. Sequence per entity:
-1. Send `SIGTERM` to process group
-2. Wait configurable timeout (default 5s, Docker gets more)
+**Process group kill**: Signals are sent to the entire process group (`kill(-pgid, ...)`), not just the shell PID. This ensures child processes (e.g., `node server.js` spawned by `npm run dev`) are killed too. Three-step sequence per entity:
+1. Send `SIGHUP` to process group (traditional terminal-close signal, shells handle it for cleanup)
+2. Poll `try_wait()` at 50ms intervals for up to 250ms grace period
 3. Send `SIGKILL` to process group if still alive
 4. Remove `Running` component only after confirmed process exit
+
+For non-shell processes (Docker, agents): use `SIGTERM` instead of `SIGHUP` with longer timeout (5s).
 
 **Crash safety**: On Linux, child processes are spawned with `PR_SET_PDEATHSIG(SIGTERM)` so they die if the Yord process crashes. On Windows, Job Objects group child processes for reliable cleanup. PIDs/PGIDs are persisted in SQLite so the next launch can detect and clean up orphans.
 
@@ -366,13 +368,25 @@ Component changes cover all state transitions — `Running` added means started,
 ### 7.6 Implementation Notes (from research)
 
 **PTY spawning:**
-- Use `setsid()` (Linux/macOS) to create a new process group per PTY
+- Use `portable-pty` 0.9+ (`native_pty_system().openpty()` → `slave.spawn_command()`)
+- `setsid()` (Linux/macOS) to create new process group per PTY
 - On Windows, use `CREATE_NEW_PROCESS_GROUP` flag + Job Objects
 - Store both PID and PGID in `Running` component
 - Set `PR_SET_PDEATHSIG(SIGTERM)` on Linux for crash safety
 - Respect `$SHELL` and launch as interactive shell by default
-- PTY reads are blocking — use `spawn_blocking` thread per PTY, never read in async task directly
+- PTY reads are blocking — use `std::thread::spawn` per PTY reader (not Tokio `spawn_blocking`)
 - EOF detection differs: Unix drops slave side; Windows needs explicit EOT (`\x04`)
+- Use `close_fds` crate for closing inherited file descriptors after fork (zellij pattern)
+- Use `ChildKiller` trait handle for kill from manager thread while reader thread blocks on `wait()`
+- Kill flag (`Arc<AtomicBool>`) for clean reader thread shutdown, not relying solely on EOF
+- macOS PATH fix: GUI apps don't inherit shell PATH — augment with `~/.cargo/bin`, Homebrew paths etc.
+- Remove `npm_config_prefix` env before spawn (node version managers break npm)
+- Filter `CLAUDECODE*`/`CLAUDE_CODE*` env vars to prevent nested session detection
+- Drop order: slave immediately after spawn, master only after child exits
+- Writer must be `take_writer()` even if unused — otherwise no EOF on drop, child blocks forever
+- EIO handling: macOS returns `ErrorKind::Other`, Linux returns `BrokenPipe` on child exit — both are normal EOF
+- On terminal reconnect/restore: prepend `\033c` reset sequence to clear stale colors/cursor state
+- ConPTY on Windows injects unsolicited escape sequences — account for in any output filtering/logging
 
 **PTY process management (actor pattern):**
 - Use an actor (mpsc channel) instead of `Arc<Mutex<HashMap>>` for the PTY registry
@@ -382,7 +396,18 @@ Component changes cover all state transitions — `Running` added means started,
 **App shutdown:**
 - Tauri's `MenuItem::Quit` calls `exit(0)` immediately, skipping destructors
 - Must use custom quit handler + `RunEvent::ExitRequested` for cleanup
+- Also handle `on_window_event(Destroyed)` to kill PTY children (canopy/Clif-Code pattern)
 - On startup, sweep for orphaned PIDs from previous crashes (stored in SQLite)
+
+**Foreground process tracking (post-M1):**
+- `libc::tcgetpgrp(pty_fd)` + `sysinfo` crate to identify what's actually running in each terminal
+- Useful for dynamic tab labels ("zsh" → "npm run dev" → "node server.js")
+- Cache with ~300ms TTL (wezterm pattern)
+
+**Scrollback persistence (post-M1):**
+- Rust ring buffer (256KB per PTY) enables re-feeding xterm.js after macOS WKWebView jettison
+- Waveterm pattern for full restore: circular blockfile (2MB) + `@xterm/addon-serialize` snapshots
+- On restore: load snapshot, replay only data written after snapshot's offset
 
 **xterm.js:**
 - All terminal instances render in the main Svelte webview (no separate Tauri webviews)
@@ -418,9 +443,6 @@ Component changes cover all state transitions — `Running` added means started,
 **PTY resize:**
 - Debounce resize events (50-100ms) during pane divider drags
 - Send fresh resize when a hidden terminal becomes visible
-
-**Scrollback persistence (future, post-M1):**
-- Rust ring buffer (256KB per PTY) enables re-feeding xterm.js after macOS WKWebView jettison or session restore
 
 **Svelte performance:**
 - Use `$state.raw()` (not `$state()`) for entity/tree data from Rust — deep proxies cause 5,000x slowdown on tree structures

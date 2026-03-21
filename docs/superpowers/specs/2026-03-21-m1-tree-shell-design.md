@@ -1,0 +1,395 @@
+# M1 — Tree + Shell: Design Spec
+
+> Milestone 1 for Yord. Scope: Tauri 2 + Svelte 5 scaffold, ECS storage, tree UI, terminal PTY, kill propagation, session restore.
+
+---
+
+## 1. What M1 Delivers
+
+A desktop app where you create projects, add terminal nodes, and manage everything in a tree. Processes are tracked, killed cleanly, and restored on restart.
+
+**In scope:**
+- Tauri 2 + Svelte 5 + TypeScript scaffold
+- ECS storage layer (entities + components tables, rusqlite)
+- Tree panel UI (buildTree() from flat data, collapsible, context menu)
+- Entity CRUD (create/delete/rename projects and terminals)
+- PTY (spawn per Pty component, xterm.js rendering, write/resize)
+- Kill propagation (depth-first by component type, process group kill, respect Pinned)
+- Session restore (progressive 4-phase, respawn Pty.cmd in Pty.cwd)
+
+**Out of scope:**
+- Tiling/split layout engine (M2)
+- Browser/editor/filemanager nodes (M3)
+- Agent nodes (M4)
+- Plugin system, workspace switcher, quick nav, scrollback persistence
+
+---
+
+## 2. Stack
+
+| Layer | Choice | Reason |
+|-------|--------|--------|
+| Frontend | Svelte 5 + TypeScript | Fine-grained reactivity, no vdom |
+| Desktop | Tauri 2 | Native webview, no Chromium bundle |
+| Backend | Rust | Process management, PTY, SQLite |
+| Terminal | xterm.js (canvas default, WebGL fallback up) | Industry standard |
+| PTY | portable-pty 0.9+ | Cross-platform, from wezterm |
+| Storage | rusqlite | Single-writer + WAL, in-memory cache |
+| IPC typed | taurpc + specta | Auto-gen TS types from Rust traits |
+| IPC streaming | Tauri 2 Channel\<T\> | Per-PTY high-throughput data |
+| Package manager | Bun | Fast installs |
+| CSS | Plain CSS + CSS variables | Scoped Svelte styles |
+
+---
+
+## 3. Data Model
+
+### 3.1 ECS from day one
+
+Entity IDs are UUID v7 (time-sortable, unique). Generated via the `uuid` crate with `v7` feature.
+
+Two SQLite tables:
+
+```sql
+PRAGMA foreign_keys = ON;
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
+PRAGMA busy_timeout = 5000;
+PRAGMA temp_store = MEMORY;
+PRAGMA mmap_size = 268435456;
+PRAGMA cache_size = -16000;
+
+CREATE TABLE entities (
+  id         TEXT PRIMARY KEY,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE components (
+  entity_id      TEXT NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+  component_type TEXT NOT NULL,
+  data           TEXT NOT NULL,  -- JSON
+  PRIMARY KEY (entity_id, component_type)
+);
+
+CREATE INDEX idx_component_type ON components(component_type);
+CREATE INDEX idx_belongs_to ON components(component_type, json_extract(data, '$.parent_id'))
+  WHERE component_type = 'BelongsTo';
+```
+
+Single-writer connection + reader pool. Verify bundled SQLite >= 3.51.3 (WAL-reset data race fix).
+
+### 3.2 M1 Components
+
+```
+// Structural
+Label:          { text, icon?, color? }
+BelongsTo:      { parent_id }              // single parent for M1
+Order:          { index }
+
+// Identity
+Project:        { cwd }
+Pty:            { cmd, cwd, env? }
+
+// Lifecycle
+Running:        { pid, pgid, started_at }
+Crashed:        { exit_code, stderr_tail }
+RestoreOnStart: {}
+Pinned:         {}
+```
+
+Lifecycle states derived from component presence (no stored state field).
+
+---
+
+## 4. Swappable Boundary Traits
+
+```rust
+trait EntityStore {
+    fn create(&self, components: Vec<ComponentData>) -> Result<EntityId>;
+    fn delete(&self, id: &EntityId) -> Result<()>;
+    fn get(&self, id: &EntityId) -> Result<EntityWithComponents>;
+    fn get_all(&self) -> Result<Vec<EntityWithComponents>>;
+    fn set_component(&self, id: &EntityId, component: ComponentData) -> Result<()>;
+    fn remove_component(&self, id: &EntityId, comp_type: &str) -> Result<()>;
+    fn query(&self, filters: &[ComponentFilter]) -> Result<Vec<EntityWithComponents>>;
+}
+
+trait PtyBackend {
+    fn spawn(&self, cmd: &[String], cwd: &str, env: &HashMap<String, String>) -> Result<PtyHandle>;
+    fn write(&self, handle: &PtyHandle, data: &[u8]) -> Result<()>;
+    fn resize(&self, handle: &PtyHandle, cols: u16, rows: u16) -> Result<()>;
+    fn kill(&self, handle: &PtyHandle) -> Result<()>;
+}
+
+trait ProcessManager {
+    fn kill_group(&self, pgid: u32, signal: Signal) -> Result<()>;
+    fn is_alive(&self, pid: u32) -> bool;
+    fn children(&self, pid: u32) -> Result<Vec<u32>>;
+}
+```
+
+M1 implementations: `SqliteEntityStore`, `PortablePtyBackend`, `UnixProcessManager` / `WindowsProcessManager`.
+
+---
+
+## 5. Rust Backend
+
+### 5.1 Systems
+
+- **LifecycleSystem** — spawn/kill/restart PTY processes
+- **RestoreSystem** — progressive 4-phase restore on startup
+- **KillProjectSystem** — depth-first by component type, process group kill
+- **PersistSystem** — debounced write to SQLite with WAL mode
+
+### 5.2 PTY Spawning
+
+- `portable-pty` 0.9+: `openpty()` → `slave.spawn_command()` → drop slave immediately
+- `setsid()` for new process group (Linux/macOS)
+- `CREATE_NEW_PROCESS_GROUP` + Job Objects (Windows)
+- `PR_SET_PDEATHSIG(SIGTERM)` on Linux for crash safety
+- `close_fds` crate for fd hygiene after fork
+- `take_writer()` even if unused (prevents child blocking on stdin forever)
+- `std::thread::spawn` per PTY reader (not Tokio — avoids thread pool starvation)
+- Kill flag (`Arc<AtomicBool>`) + `ChildKiller` handle for clean shutdown
+- Respect `$SHELL`, launch as interactive shell by default
+- Remove `npm_config_prefix` env, filter `CLAUDECODE*` env vars
+- macOS PATH augmentation (`~/.cargo/bin`, Homebrew paths, nvm/fnm)
+- EIO handling: macOS `ErrorKind::Other`, Linux `BrokenPipe` — both are normal EOF
+
+### 5.3 PTY Output Streaming
+
+- Rust ring buffer (256KB per PTY)
+- Flush every 16ms (60fps) or at 4KB threshold
+- One Tauri 2 `Channel<PtyOutput>` per entity
+- Raw `Vec<u8>` / `Uint8Array` (not string conversion — handles non-UTF-8)
+
+### 5.4 PTY Process Management (Actor Pattern)
+
+```rust
+enum PtyCommand {
+    Spawn { id: EntityId, cmd: Vec<String>, cwd: String, reply: oneshot::Sender<Result<()>> },
+    Write { id: EntityId, data: Vec<u8> },
+    Resize { id: EntityId, cols: u16, rows: u16 },
+    Kill { id: EntityId },
+}
+```
+
+Single actor task owns all PTY state. No `Arc<Mutex<HashMap>>`.
+
+### 5.5 Kill Propagation
+
+Depth-first by component type:
+1. Entities with `Agent` component
+2. Entities with `Pty` component
+3. Entities with `Editor` component
+4. Entities with `Docker` component
+5. Entities with `Webview` component
+
+M1 implements kill for `Pty` only. Other component types listed for forward compatibility.
+
+Entities with `Pinned` component are skipped.
+
+Per-entity kill sequence (PTY):
+1. `SIGHUP` to process group (traditional terminal-close signal)
+2. Poll `try_wait()` at 50ms intervals for 250ms grace
+3. `SIGKILL` to process group if still alive
+4. Remove `Running` component after confirmed exit
+
+Non-shell processes (Docker, agents): `SIGTERM` with 5s timeout.
+
+### 5.6 App Shutdown
+
+- Custom quit handler + `RunEvent::ExitRequested` (Tauri's default Quit skips destructors)
+- `on_window_event(Destroyed)` to kill PTY children
+- On startup: sweep SQLite for stale `Running` PIDs from previous crashes
+
+### 5.7 Session Restore (Progressive)
+
+**Phase 1 (0–200ms):** Load entities from SQLite. Show tree with skeleton UI. Use `tauri-plugin-window-state` for window geometry restore.
+
+**Phase 2 (200ms–1s):** Stale PID cleanup. Spawn focused terminal only.
+
+**Phase 3 (1–5s):** Validate `Pty.cwd` exists and `Pty.cmd` on PATH. Spawn remaining `RestoreOnStart` entities. Show errors for invalid ones.
+
+**Phase 4 (5s+):** `PRAGMA optimize`.
+
+On terminal restore: prepend `\033c` reset to clear stale terminal state.
+
+---
+
+## 6. IPC
+
+### 6.1 Commands (taurpc)
+
+```rust
+#[taurpc::procedures]
+trait YordApi {
+    fn create_entity(components: Vec<ComponentData>) -> Result<EntityId>;
+    fn delete_entity(id: String) -> Result<()>;
+    fn get_entities() -> Result<Vec<EntityWithComponents>>;
+    fn set_component(entity_id: String, component: ComponentData) -> Result<()>;
+    fn remove_component(entity_id: String, component_type: String) -> Result<()>;
+    fn start_entity(id: String) -> Result<()>;
+    fn stop_entity(id: String) -> Result<()>;
+    fn restart_entity(id: String) -> Result<()>;
+    fn kill_project(id: String) -> Result<()>;
+    fn pty_write(entity_id: String, data: Vec<u8>) -> Result<()>;
+    fn pty_resize(entity_id: String, cols: u16, rows: u16) -> Result<()>;
+    // allocate_port / release_port deferred to M3 (web nodes)
+}
+```
+
+### 6.2 Events and Channels
+
+```
+// Events (low-frequency)
+"entity:component-changed"  { entity_id, component_type, data }
+"entity:removed"            { entity_id }
+
+// Channels (per-PTY, high-frequency)
+Channel<PtyOutput> { entity_id, data: Vec<u8> }
+```
+
+Cleanup: every `listen()` and Channel `onmessage` cleaned up on component destroy. Delete `channel.onmessage` explicitly (known memory leak #13133).
+
+---
+
+## 7. Frontend
+
+### 7.1 Tree Panel
+
+- `buildTree()` reactively derives tree from flat entity data
+- Use `$state.raw()` for entity data (NOT `$state()` — 5,000x perf cliff with deep proxies)
+- Collapsible, color-coded status dots (green=Running, red=Crashed, grey=idle)
+- Right-click context menu: start / stop / restart / rename / delete / add child
+- Drag to reorder (updates `Order` component)
+- Drag onto project to reparent (updates `BelongsTo` component)
+
+### 7.2 Terminal View
+
+- All xterm.js instances in main Svelte webview (no separate Tauri webviews)
+- Renderer fallback: WebGL → Canvas → DOM
+- Lazy instantiation (only visible terminals get DOM-mounted)
+- `@xterm/addon-fit`, `@xterm/addon-search` (`Cmd+F`)
+- Default scrollback: 5,000 lines
+- Ship bundled monospace font (system monospace fallback)
+- Escape sequence sanitization: whitelist allowed, strip OSC 52, DECRQSS, title set/report
+
+### 7.3 Focus & Keyboard
+
+- Tracked in Svelte store with visual border on active pane
+- Global shortcuts use `Cmd`/`Super` — never intercept `Ctrl+C/D/Z/L/R`
+- Check `event.isComposing` before acting (IME safety)
+
+### 7.4 M1 Layout (Simple)
+
+Tree panel on left, single terminal view on right. Click a terminal node to view it. No tiling/splitting (M2).
+
+### 7.5 Security
+
+- Enable CSP in `tauri.conf.json` — allow `blob:`, `data:`, `wasm-unsafe-eval` for xterm.js
+- Audit capability files in `src-tauri/capabilities/`
+
+---
+
+## 8. Error Handling
+
+Use `thiserror` for a structured `YordError` enum:
+
+```rust
+#[derive(thiserror::Error, Debug)]
+enum YordError {
+    #[error("Entity not found: {0}")]
+    EntityNotFound(String),
+    #[error("Component not found: {entity_id}/{component_type}")]
+    ComponentNotFound { entity_id: String, component_type: String },
+    #[error("PTY error: {0}")]
+    Pty(String),
+    #[error("Database error: {0}")]
+    Db(#[from] rusqlite::Error),
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+}
+```
+
+Errors serialized to frontend as structured JSON via taurpc. Frontend displays errors in the tree node (Crashed state with stderr tail) or as toast notifications.
+
+---
+
+## 9. Testing Strategy
+
+- **EntityStore**: in-memory `HashMap`-backed implementation of the `EntityStore` trait for unit tests. No SQLite dependency in unit tests.
+- **PtyBackend**: mock implementation that simulates spawn/write/kill without real processes.
+- **Integration tests**: real SQLite + real PTY on CI. Test spawn, write, resize, kill propagation, session restore.
+- **Frontend**: vitest for `buildTree()` logic and store derivations. No E2E in M1.
+- **CI**: GitHub Actions matrix: Ubuntu, macOS, Windows.
+
+---
+
+## 10. Directory Structure
+
+```
+yord/
+├── src-tauri/src/
+│   ├── main.rs
+│   ├── commands/          (taurpc trait + handlers)
+│   ├── ecs/
+│   │   ├── entity.rs      (Entity struct)
+│   │   ├── component.rs   (Component types + ComponentData enum)
+│   │   ├── traits.rs      (EntityStore, PtyBackend, ProcessManager)
+│   │   └── store.rs       (SqliteEntityStore)
+│   ├── systems/
+│   │   ├── lifecycle.rs   (LifecycleSystem)
+│   │   ├── restore.rs     (RestoreSystem)
+│   │   ├── kill.rs        (KillProjectSystem)
+│   │   └── persist.rs     (PersistSystem)
+│   ├── db/
+│   │   ├── mod.rs
+│   │   └── migrations/
+│   └── process/
+│       ├── pty.rs         (PortablePtyBackend, reader thread)
+│       └── port_pool.rs
+├── src/
+│   ├── lib/stores/        (entities, tree, focus)
+│   ├── lib/types/         (entity, tree — auto-gen from Rust)
+│   ├── lib/ipc/           (taurpc client wrappers)
+│   ├── components/tree/   (TreePanel, TreeNode, ContextMenu)
+│   ├── components/views/  (TerminalView)
+│   └── App.svelte
+└── package.json
+```
+
+---
+
+## 11. Platforms
+
+Linux, Windows, macOS, Android, iOS. Browser deferred.
+
+- Windows: minimum 10 1809+ (ConPTY)
+- Linux: WebKitGTK 2.42+ recommended
+- Dev/test on Linux first
+
+---
+
+## 12. Cross-Platform Notes
+
+- Avoid `backdrop-filter` CSS (broken on WebKitGTK)
+- Test CJK characters and emoji rendering on all platforms
+- ConPTY injects unsolicited escape sequences — account for in filtering
+- PTY resize: debounce 50-100ms, fresh resize when hidden terminal becomes visible
+
+---
+
+## 13. Research References
+
+- `docs/research/ide-pain-points.md` — VS Code, Neovim, tmux/zellij pain points
+- `docs/research/ide-path.md` — IDE architecture lessons (Xi, Atom, VS Code, Zed, Lapce)
+- `docs/research/tauri-pitfalls.md` — Tauri 2 bugs, security, performance traps
+- `docs/refs/report.md` — 9 reference project survey
+- `docs/refs/projects/` — per-project deep research
+
+---
+
+*Spec version 1.0 — 2026-03-21*
+*Approved after brainstorming session with 3 review rounds on design docs*
