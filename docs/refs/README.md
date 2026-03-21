@@ -44,12 +44,12 @@
 
 | File | Overview | Arch Decisions | Bugs & Fixes | Tech Debt | Lessons | Issues | Key Files |
 |------|----------|---------------|-------------|-----------|---------|--------|-----------|
-| canopy.md | Done | - | - | - | - | - | Done |
-| clif-code.md | Done | - | - | - | - | - | Done |
-| waveterm.md | Done | - | - | - | - | - | Done |
-| wezterm.md | Done | - | - | - | - | - | Done |
-| zellij.md | Done | - | - | - | - | - | Done |
-| zed.md | Done | - | - | - | - | - | Done |
-| helix.md | Done | - | - | - | - | - | Done |
-| tauri-terminal.md | Done | - | - | - | - | - | Done |
-| tauri-plugin-pty.md | Done | - | - | - | - | - | Done |
+| canopy.md | Done | Done | Done | Done | Done | Done | Done |
+| clif-code.md | Done | Done | Done | Done | Done | Done | Done |
+| waveterm.md | Done | Done | Done | Done | Done | Done | Done |
+| wezterm.md | Done | Done | Done | Done | Done | Done | Done |
+| zellij.md | Done | Done | Done | Done | Done | Done | Done |
+| zed.md | Done | Done | Done | Done | Done | Done | Done |
+| helix.md | Done | Done | Done | Done | Done | Done | Done |
+| tauri-terminal.md | Done | Done | Done | Done | Done | Done | Done |
+| tauri-plugin-pty.md | Done | Done | Done | Done | Done | Done | Done |
